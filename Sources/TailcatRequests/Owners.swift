@@ -84,9 +84,22 @@ extension Requests {
             public var messaging: Messaging.Configuration
             /// Bounds framing, handler execution, and response delivery; requires iOS 16+ or macOS 13+.
             public var requestTimeout: TimeInterval?
+            fileprivate var sleep: @Sendable (TimeInterval) async throws -> Void = { timeout in
+                if #available(iOS 16, macOS 13, *) {
+                    try await ContinuousClock().sleep(for: .seconds(timeout))
+                } else {
+                    throw MessageFailure.invalidConfiguration
+                }
+            }
             public init(maxConnections: Int = 16, messaging: Messaging.Configuration = .init(), requestTimeout: TimeInterval? = nil) {
                 self.maxConnections = maxConnections; self.messaging = messaging
                 self.requestTimeout = requestTimeout
+            }
+            /// Supplies a clock for deterministic request deadlines.
+            @available(iOS 16, macOS 13, *)
+            public init<C: Clock>(clock: C, maxConnections: Int = 16, messaging: Messaging.Configuration = .init(), requestTimeout: TimeInterval? = nil) where C.Duration == Duration {
+                self.init(maxConnections: maxConnections, messaging: messaging, requestTimeout: requestTimeout)
+                sleep = { try await clock.sleep(for: .seconds($0)) }
             }
             func validate() throws {
                 try messaging.validate()
@@ -162,7 +175,7 @@ private func serveMessage(configuration: Requests.Listener.Configuration, handle
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await serveMessage(configuration: configuration.messaging, handlers: handlers, raw: raw) }
             group.addTask {
-                do { try await Task.sleep(for: .seconds(timeout)) }
+                do { try await configuration.sleep(timeout) }
                 catch { return }
             }
             await group.next()

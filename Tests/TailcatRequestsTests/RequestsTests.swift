@@ -1,5 +1,5 @@
 import Foundation
-import XCTest
+import Testing
 @testable import Tailcat
 @testable import TailcatRequests
 
@@ -56,19 +56,8 @@ private struct Fixture: Sendable {
     }
 }
 
-final class RequestsTests: XCTestCase {
-    private func deadline<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask { try await operation() }
-            group.addTask {
-                try await Task.sleep(nanoseconds: 10_000_000_000)
-                throw TailcatTransportError.timedOut
-            }
-            defer { group.cancelAll() }
-            return try await group.next()!
-        }
-    }
-
+struct RequestsTests {
+    @Test(.unitTimeout)
     func testTypedCallsUseIndependentStreams() async throws {
         let f = try await Fixture.make()
         let server = try Requests.Listener(listener: f.listener) {
@@ -76,17 +65,18 @@ final class RequestsTests: XCTestCase {
             Handle(Empty.self) { _ in () }
         }
         do {
-            try await deadline {
+            do {
                 async let first = f.connection.call(Echo.self, input: "one")
                 async let second = f.connection.call(Echo.self, input: "two")
                 let values = try await [first, second]
-                XCTAssertEqual(values, ["reply:one", "reply:two"])
+                #expect(values == ["reply:one", "reply:two"])
                 try await f.connection.call(Empty.self)
             }
         } catch { try? await server.close(); await f.close(); throw error }
         try await server.close(); await f.close()
     }
 
+    @Test(.unitTimeout)
     func testDuplexYieldsAndFinalResult() async throws {
         let f = try await Fixture.make()
         let server = try Requests.Listener(listener: f.listener) {
@@ -100,62 +90,68 @@ final class RequestsTests: XCTestCase {
             }
         }
         do {
-            try await deadline {
+            do {
                 let stream = try await f.connection.open(Duplex.self, input: 10)
                 try await stream.send(2)
                 try await stream.send(3)
                 try await stream.finishSending()
                 var yielded: [Int] = []
                 for try await value in stream.incoming { yielded.append(value) }
-                XCTAssertEqual(yielded, [12, 15])
+                #expect(yielded == [12, 15])
                 let result = try await stream.result()
-                XCTAssertEqual(result, 15)
+                #expect(result == 15)
             }
         } catch { try? await server.close(); await f.close(); throw error }
         try await server.close(); await f.close()
     }
 
+    @Test(.unitTimeout)
     func testMissingRouteAndHandlerFailureAreRemoteErrors() async throws {
         let f = try await Fixture.make()
         let server = try Requests.Listener(listener: f.listener) {
             Handle(Echo.self) { _ in throw Reject.secret }
         }
         do {
-            try await deadline {
-                do { _ = try await f.connection.call(Missing.self); XCTFail("Missing route succeeded") }
+            do {
+                do { _ = try await f.connection.call(Missing.self); Issue.record("Missing route succeeded") }
                 catch let error as Requests.Messaging.Failure {
-                    XCTAssertEqual(error, .remote(code: "request_failed", message: "Request could not be completed"))
+                    #expect(error == .remote(code: "request_failed", message: "Request could not be completed"))
                 }
-                do { _ = try await f.connection.call(Echo.self, input: "private"); XCTFail("Rejected handler succeeded") }
+                do { _ = try await f.connection.call(Echo.self, input: "private"); Issue.record("Rejected handler succeeded") }
                 catch let error as Requests.Messaging.Failure {
-                    XCTAssertEqual(error, .remote(code: "request_failed", message: "Request could not be completed"))
+                    #expect(error == .remote(code: "request_failed", message: "Request could not be completed"))
                 }
             }
         } catch { try? await server.close(); await f.close(); throw error }
         try await server.close(); await f.close()
     }
 
+    @Test(.unitTimeout)
     func testDuplicateHandlersAreRejectedBeforeServing() async throws {
         let f = try await Fixture.make()
-        XCTAssertThrowsError(try Requests.Listener(listener: f.listener) {
-            Handle(Echo.self) { $0 }
-            Handle(Echo.self) { $0 }
-        })
+        #expect(throws: Requests.Messaging.Failure.invalidRequest) {
+            try Requests.Listener(listener: f.listener) {
+                Handle(Echo.self) { $0 }
+                Handle(Echo.self) { $0 }
+            }
+        }
         await f.close()
     }
 
+    @Test(.unitTimeout)
     func testOversizedInputIsRejectedAndConnectionRemainsUsable() async throws {
         let f = try await Fixture.make(configuration: .init(messaging: .init(maxEncodedMessageBytes: 16)))
         let server = try Requests.Listener(listener: f.listener) { Handle(Echo.self) { $0 } }
         do {
-            do { _ = try await f.connection.call(Echo.self, input: String(repeating: "x", count: 20)); XCTFail("Oversized input succeeded") }
-            catch let error as Requests.Messaging.Failure { XCTAssertEqual(error, .oversizedMessage) }
-            let output = try await deadline { try await f.connection.call(Echo.self, input: "small") }
-            XCTAssertEqual(output, "small")
+            do { _ = try await f.connection.call(Echo.self, input: String(repeating: "x", count: 20)); Issue.record("Oversized input succeeded") }
+            catch let error as Requests.Messaging.Failure { #expect(error == .oversizedMessage) }
+            let output = try await f.connection.call(Echo.self, input: "small")
+            #expect(output == "small")
         } catch { try? await server.close(); await f.close(); throw error }
         try await server.close(); await f.close()
     }
 
+    @Test(.unitTimeout)
     func testCancellingAnOpenStreamReleasesItsCapacity() async throws {
         let f = try await Fixture.make(configuration: .init(maxConcurrentRequests: 1))
         let server = try Requests.Listener(listener: f.listener) {
@@ -166,18 +162,19 @@ final class RequestsTests: XCTestCase {
             Handle(Echo.self) { $0 }
         }
         do {
-            try await deadline {
+            do {
                 let stream = try await f.connection.open(Duplex.self, input: 0)
                 let waiting = Task { try await stream.result() }
                 waiting.cancel()
-                do { _ = try await waiting.value; XCTFail("Cancelled result succeeded") } catch { }
+                do { _ = try await waiting.value; Issue.record("Cancelled result succeeded") } catch { }
                 let output = try await f.connection.call(Echo.self, input: "after cancellation")
-                XCTAssertEqual(output, "after cancellation")
+                #expect(output == "after cancellation")
             }
         } catch { try? await server.close(); await f.close(); throw error }
         try await server.close(); await f.close()
     }
 
+    @Test(.unitTimeout)
     func testClosingConnectionStopsActiveRequestsAndRejectsNewOnes() async throws {
         let f = try await Fixture.make()
         let server = try Requests.Listener(listener: f.listener) {
@@ -187,16 +184,17 @@ final class RequestsTests: XCTestCase {
             }
         }
         do {
-            try await deadline {
+            do {
                 let stream = try await f.connection.open(Duplex.self, input: 0)
                 try await f.connection.close()
-                do { _ = try await stream.result(); XCTFail("Closed request succeeded") } catch { }
-                do { _ = try await f.connection.open(Duplex.self, input: 0); XCTFail("Closed owner admitted a request") } catch { }
+                do { _ = try await stream.result(); Issue.record("Closed request succeeded") } catch { }
+                do { _ = try await f.connection.open(Duplex.self, input: 0); Issue.record("Closed owner admitted a request") } catch { }
             }
         } catch { try? await server.close(); await f.close(); throw error }
         try await server.close(); await f.close()
     }
 
+    @Test(.unitTimeout)
     func testFrameReaderRejectsMalformedOversizedAndTruncatedBytes() async throws {
         let vectors: [[UInt8]] = [
             [0,67,65,84,1,3,0,0,0,1],
@@ -209,7 +207,7 @@ final class RequestsTests: XCTestCase {
         for vector in vectors {
             let f = try await Fixture.make()
             do {
-                try await deadline {
+                do {
                     let client = try await f.a.connect(peer: f.listener.localAddress, port: f.listener.port)
                     let accepted = try await f.listener.accept()
                     let writer = Task {
@@ -218,9 +216,9 @@ final class RequestsTests: XCTestCase {
                     }
                     do {
                         _ = try await MessageReader(raw: MessageTransport(accepted), limit: 8).read()
-                        XCTFail("Malformed frame was accepted")
+                        Issue.record("Malformed frame was accepted")
                     } catch let error as Requests.Messaging.Failure {
-                        XCTAssertTrue(error == .malformedFrame || error == .oversizedMessage)
+                        #expect(error == .malformedFrame || error == .oversizedMessage)
                     }
                     await client.abort(); await accepted.abort()
                     _ = await writer.result
@@ -230,14 +228,16 @@ final class RequestsTests: XCTestCase {
         }
     }
 
+    @Test(.unitTimeout)
     func testFourMiBEnvelopeFitsTheDefaultLimit() throws {
         let payload = Data(repeating: 255, count: 4 * 1024 * 1024)
         let encoded = try MessageCodec<Data>.codable.encode(payload)
-        XCTAssertLessThanOrEqual(encoded.count, Requests.Messaging.Configuration().maxEncodedMessageBytes)
-        XCTAssertEqual(try MessageCodec<Data>.codable.decode(encoded), payload)
+        #expect(encoded.count <= Requests.Messaging.Configuration().maxEncodedMessageBytes)
+        #expect(try MessageCodec<Data>.codable.decode(encoded) == payload)
     }
 
 
+    @Test(.unitTimeout)
     func testServerCompletionUnblocksUnreadInboundQueue() async throws {
         let f = try await Fixture.make()
         let client = try await f.a.connect(peer: f.listener.localAddress, port: f.listener.port)
@@ -247,12 +247,11 @@ final class RequestsTests: XCTestCase {
         try await flow.state.inbox.put(Data([1]))
         flow.state.tasks.start { try? await flow.state.inbox.put(Data([2])) }
         try await flow.state.terminal((), codec: .empty)
-        let closed = expectation(description: "completed server flow joins its blocked inbound producer")
-        let cleanup = Task { await flow.close(); closed.fulfill() }
-        await fulfillment(of: [closed], timeout: 1)
-        // Release a regressed producer too, so a failing test never hangs the suite.
-        flow.state.inbox.finish(MessageFailure.closed)
-        await cleanup.value
+        await withTaskCancellationHandler {
+            await flow.close()
+        } onCancel: {
+            flow.state.inbox.finish(MessageFailure.closed)
+        }
         await client.abort()
         await f.close()
     }

@@ -175,7 +175,9 @@ Limits default to 16 active requests/connections, 2 buffered incoming messages,
 `Requests.Messaging.Configuration`. Set `Requests.Listener.Configuration.requestTimeout` to bound the complete accepted
 request, including framing, handler execution, and response delivery. It defaults to
 `nil`; non-nil deadlines require iOS 16+ or macOS 13+. Expiration cancels and joins
-the request before releasing its connection slot.
+the request before releasing its connection slot. For deterministic deadlines,
+pass a native `Clock` through `Requests.Listener.Configuration(clock:requestTimeout:)`;
+the default clock remains `ContinuousClock`.
 
 Handler failures are returned as a generic
 remote error without exposing the underlying application's error text.
@@ -185,23 +187,10 @@ Compatibility with that package is not a supported contract. The original
 transport API remains available independently.
 
 Run all tests with `swift test`. The request unit tests use two real userspace
-TCP stacks connected in memory and require no external relay:
+TCP stacks connected in memory and require no external relay. Every request test
+has a 90 ms watchdog. Deadline behavior uses Swift Clocks' `TestClock` and explicit
+virtual-time advances; `swift-clocks` is a test-only dependency:
 
 ```sh
-swift test --filter RequestsTests
+swift test --filter 'RequestsTests|RequestDeadlineTests'
 ```
-
-## Upstream updates
-
-The **Check upstream** GitHub Actions workflow checks `slopus/tailcat-swift:main`
-every Monday at 16:17 UTC and can also be run manually from the Actions tab. When
-upstream has new commits, it opens one pull request into this fork's `main`.
-An existing open PR follows upstream automatically; the workflow does not create
-duplicates or merge changes. Use a merge commit when accepting these PRs so that
-subsequent checks recognize upstream history as integrated.
-
-The workflow uses the repository's `GITHUB_TOKEN`; GitHub Actions and **Allow
-GitHub Actions to create and approve pull requests** must be enabled in repository
-settings. No personal token or additional secret is required. GitHub may disable
-scheduled workflows after 60 days without repository activity; re-enable the
-workflow in the Actions tab if that happens.
