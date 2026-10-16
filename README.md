@@ -121,3 +121,67 @@ Like upstream, this project makes no API or wire-format stability promise.
 
 BSD 3-Clause, the same license as upstream tailcat. See [LICENSE](LICENSE), which keeps the
 original Tailscale copyright notice.
+
+
+## Optional typed requests
+
+This fork adds the `TailcatRequests` product. Add it to an application's target
+only when typed requests and handlers are needed; `Tailcat` itself has no
+dependency on it. Both products are native Swift, with no external packages.
+
+```swift
+import Tailcat
+import TailcatRequests
+
+enum Echo: Request {
+    typealias Input = String
+    typealias Output = String
+    static let event = "echo"
+}
+
+let server = TailcatServer()
+let listener = try await server.listenRequests(port: 7000) {
+    Handle(Echo.self) { "Received: " + $0 }
+}
+
+let client = try await TailcatClient.connect(to: server.address)
+let requests = try Requests.Connection(client: client, port: listener.port)
+let reply = try await requests.call(Echo.self, input: "hello")
+
+try await requests.close()
+try await listener.close()
+await client.close()
+await server.close()
+```
+
+Each call opens an independent TCP stream on the shared peer connection.
+`Request` has four typed lanes: `Input` and `Output` default to `Void`, while
+streamed `Inbound` and `Yield` default to `Never`. Present lanes use `Codable`
+and `Sendable` values. For duplex requests, use `requests.open(...)`,
+`send(...)`, `finishSending()`, `incoming`, and `result()`; a handler receives
+its own `stream.incoming` and emits values with `stream.yield(...)`.
+
+Consume yielded values before awaiting the final result (or consume them
+concurrently), because incoming queues apply backpressure. Each incoming lane
+and final result has a single consumer. `resetAndWait()` cancels an unfinished
+request. Cancellation or closing the request owner interrupts its active flows.
+Request owners borrow the native `TailcatClient`; request listeners own their
+TCP listener but borrow the native `TailcatServer`. Close the native peers
+separately when finished. Application handlers must cooperate with cancellation.
+
+Limits default to 16 active requests/connections, 2 buffered incoming messages,
+16 pending sends per flow, and 8 MiB per encoded message. Configure these through
+`Requests.Connection.Configuration`, `Requests.Listener.Configuration`, and
+`Requests.Messaging.Configuration`. Handler failures are returned as a generic
+remote error without exposing the underlying application's error text.
+
+The request layer is adapted from [zshannon/swift-tailcat](https://github.com/zshannon/swift-tailcat).
+Compatibility with that package is not a supported contract. The original
+transport API remains available independently.
+
+Run all tests with `swift test`. The request unit tests use two real userspace
+TCP stacks connected in memory and require no external relay:
+
+```sh
+swift test --filter RequestsTests
+```

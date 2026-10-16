@@ -63,7 +63,8 @@ public final class TailcatConnection: Sendable {
         await stack.closeConnection(id)
     }
 
-    internal func abort() async {
+    /// Immediately resets the stream and interrupts pending reads and writes.
+    public func abort() async {
         await stack.abortConnection(id)
     }
 }
