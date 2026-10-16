@@ -1,0 +1,62 @@
+name: Check upstream
+
+on:
+  schedule:
+    # Mondays at 16:17 UTC (09:17 PDT / 08:17 PST).
+    - cron: '17 16 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  upstream-pr:
+    if: github.repository == 'zshannon/tailcat-swift'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # No checkout: upstream code is never executed with the workflow token.
+      - name: Open an upstream pull request when needed
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const base = 'main';
+            const head = 'slopus:main';
+            const { data: comparison } = await github.rest.repos.compareCommitsWithBasehead({
+              owner, repo, basehead: `${base}...${head}`, per_page: 1,
+            });
+            if (comparison.ahead_by === 0) {
+              core.info('No new upstream commits.');
+              return;
+            }
+
+            const { data: existing } = await github.rest.pulls.list({
+              owner, repo, state: 'open', base, head, per_page: 1,
+            });
+            if (existing.length > 0) {
+              // The upstream head automatically keeps this PR up to date.
+              core.info(`Upstream changes are already tracked by ${existing[0].html_url}`);
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner, repo, base, head,
+              title: 'Merge upstream Tailcat Swift changes',
+              body: [
+                'Bring the latest commits from [slopus/tailcat-swift](https://github.com/slopus/tailcat-swift) into this fork.',
+                '',
+                'Review the changes and resolve any conflicts with the fork before merging. This workflow does not merge automatically.',
+                '',
+                'Use **Create a merge commit** to preserve upstream ancestry so future weekly checks recognize these commits as integrated.',
+                '',
+                'This PR follows upstream `main` and receives further upstream commits automatically while open.',
+              ].join('\n'),
+              maintainer_can_modify: false,
+            });
+            core.info(`Opened ${pr.html_url}`);

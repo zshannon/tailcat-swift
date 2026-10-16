@@ -185,3 +185,18 @@ TCP stacks connected in memory and require no external relay:
 ```sh
 swift test --filter RequestsTests
 ```
+
+## Upstream updates
+
+The **Check upstream** GitHub Actions workflow checks `slopus/tailcat-swift:main`
+every Monday at 16:17 UTC and can also be run manually from the Actions tab. When
+upstream has new commits, it opens one pull request into this fork's `main`.
+An existing open PR follows upstream automatically; the workflow does not create
+duplicates or merge changes. Use a merge commit when accepting these PRs so that
+subsequent checks recognize upstream history as integrated.
+
+The workflow uses the repository's `GITHUB_TOKEN`; GitHub Actions and **Allow
+GitHub Actions to create and approve pull requests** must be enabled in repository
+settings. No personal token or additional secret is required. GitHub may disable
+scheduled workflows after 60 days without repository activity; re-enable the
+workflow in the Actions tab if that happens.
