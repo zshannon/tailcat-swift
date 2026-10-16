@@ -172,7 +172,12 @@ separately when finished. Application handlers must cooperate with cancellation.
 Limits default to 16 active requests/connections, 2 buffered incoming messages,
 16 pending sends per flow, and 8 MiB per encoded message. Configure these through
 `Requests.Connection.Configuration`, `Requests.Listener.Configuration`, and
-`Requests.Messaging.Configuration`. Handler failures are returned as a generic
+`Requests.Messaging.Configuration`. Set `Requests.Listener.Configuration.requestTimeout` to bound the complete accepted
+request, including framing, handler execution, and response delivery. It defaults to
+`nil`; non-nil deadlines require iOS 16+ or macOS 13+. Expiration cancels and joins
+the request before releasing its connection slot.
+
+Handler failures are returned as a generic
 remote error without exposing the underlying application's error text.
 
 The request layer is adapted from [zshannon/swift-tailcat](https://github.com/zshannon/swift-tailcat).

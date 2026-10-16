@@ -82,12 +82,21 @@ extension Requests {
         public struct Configuration: Sendable {
             public var maxConnections: Int
             public var messaging: Messaging.Configuration
-            public init(maxConnections: Int = 16, messaging: Messaging.Configuration = .init()) {
+            /// Bounds framing, handler execution, and response delivery; requires iOS 16+ or macOS 13+.
+            public var requestTimeout: TimeInterval?
+            public init(maxConnections: Int = 16, messaging: Messaging.Configuration = .init(), requestTimeout: TimeInterval? = nil) {
                 self.maxConnections = maxConnections; self.messaging = messaging
+                self.requestTimeout = requestTimeout
             }
             func validate() throws {
                 try messaging.validate()
                 guard (1...65535).contains(maxConnections) else { throw MessageFailure.invalidConfiguration }
+                if let requestTimeout {
+                    guard requestTimeout > 0, requestTimeout.isFinite, requestTimeout < Double(Int64.max) else {
+                        throw MessageFailure.invalidConfiguration
+                    }
+                    guard #available(iOS 16, macOS 13, *) else { throw MessageFailure.invalidConfiguration }
+                }
             }
         }
         public let port: UInt16
@@ -117,7 +126,7 @@ extension Requests {
                         let raw = try await listener.accept()
                         if !handlerTasks.start(limit: configuration.maxConnections, {
                             await MessageTaskScope.$owners.withValue(MessageTaskScope.owners.union([taskID])) {
-                                await serveMessage(configuration: configuration.messaging, handlers: snapshot, raw: MessageTransport(raw))
+                                await serveMessage(configuration: configuration, handlers: snapshot, raw: MessageTransport(raw))
                             }
                         }) { await raw.abort() }
                     }
@@ -141,6 +150,24 @@ extension TailcatServer {
         let listener = try await listen(port: port)
         do { return try Requests.Listener(listener: listener, configuration: configuration) { registrations } }
         catch { await listener.close(); throw error }
+    }
+}
+
+private func serveMessage(configuration: Requests.Listener.Configuration, handlers: [MessageRoute: Requests.Handler], raw: MessageTransport) async {
+    guard let timeout = configuration.requestTimeout else {
+        await serveMessage(configuration: configuration.messaging, handlers: handlers, raw: raw)
+        return
+    }
+    if #available(iOS 16, macOS 13, *) {
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await serveMessage(configuration: configuration.messaging, handlers: handlers, raw: raw) }
+            group.addTask {
+                do { try await Task.sleep(for: .seconds(timeout)) }
+                catch { return }
+            }
+            await group.next()
+            group.cancelAll()
+        }
     }
 }
 
