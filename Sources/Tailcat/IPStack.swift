@@ -109,6 +109,11 @@ internal actor IPStack {
     private let address: Data
     private let sendPacket: @Sendable (Data) async throws -> Void
     private var connections: [UUID: TCPState] = [:]
+    // Application-closed streams still finish FIN/ACK and retain TIME-WAIT,
+    // but must not consume the live connection or per-listener budgets.
+    // Bound this independently; evict the oldest close under sustained churn.
+    private var closing: [UUID: TCPState] = [:]
+    private var closingOrder: [UUID] = []
     private var flows: [FlowKey: UUID] = [:]
     private var listeners: [UUID: ListenerState] = [:]
     private var listenPorts: [UInt16: UUID] = [:]
@@ -133,7 +138,7 @@ internal actor IPStack {
     internal func connect(peer: Data, port: UInt16) async throws -> TailcatConnection {
         try validate(peer: peer, port: port)
         try Task.checkCancellation()
-        guard connections.count < 1024 else { throw TailcatTransportError.resourceLimit }
+        guard connections.count < TailcatFlowStatistics.openLimit else { throw TailcatTransportError.resourceLimit }
         let local = try allocatePort(udp: false)
         let state = TCPState(key: FlowKey(peer: peer, localPort: local, remotePort: port),
                              phase: .synSent, sequence: UInt32.random(in: .min ... .max))
@@ -170,7 +175,11 @@ internal actor IPStack {
 
     /// Includes closing and TIME-WAIT flows, so callers cannot expire a stack
     /// while it still owes a peer retransmission or a final acknowledgement.
-    internal var connectionCount: Int { connections.count }
+    internal var connectionCount: Int { connections.count + closing.count }
+
+    internal var flowStatistics: TailcatFlowStatistics {
+        TailcatFlowStatistics(open: connections.count, closing: closing.count)
+    }
 
     internal func udp(port: UInt16 = 0, idleTimeout: TimeInterval? = 120) throws -> TailcatUDPSocket {
         guard !closed else { throw TailcatTransportError.closed }
@@ -191,7 +200,7 @@ internal actor IPStack {
         closed = true
         timer?.cancel()
         timer = nil
-        for id in Array(connections.keys) { fail(id, error: TailcatTransportError.closed, reset: true) }
+        for id in Array(connections.keys) + Array(closing.keys) { fail(id, error: TailcatTransportError.closed, reset: true) }
         for id in Array(listeners.keys) { closeListener(id) }
         for id in Array(udpSockets.keys) { closeUDP(id) }
     }
@@ -199,7 +208,7 @@ internal actor IPStack {
     internal func disconnect(peer: Data) {
         // Drop queued application packets before enqueueing TCP resets.
         output.removeAll { $0.count >= 40 && Data($0[24..<40]) == peer }
-        let ids = connections.values.filter { $0.key.peer == peer }.map(\.id)
+        let ids = (Array(connections.values) + Array(closing.values)).filter { $0.key.peer == peer }.map(\.id)
         for id in ids { fail(id, error: TailcatTransportError.closed, reset: true) }
         for state in udpSockets.values { state.pending.removeAll { $0.peer == peer } }
     }
@@ -304,11 +313,11 @@ internal actor IPStack {
         let acknowledgement = Self.u32(body, 8)
         let flags = body[13]
         let payload = Data(body[headerLength...])
-        guard let id = flows[key], let state = connections[id] else {
+        guard let id = flows[key], let state = connections[id] ?? closing[id] else {
             if flags & 0x17 == 0x02, let listenerID = listenPorts[key.localPort],
                let listener = listeners[listenerID], listener.pending.count < 128,
-               connections.count < 1024,
-               connections.values.filter({ $0.listener == listenerID }).count < 256 {
+               connections.count < TailcatFlowStatistics.openLimit,
+               connections.values.filter({ $0.listener == listenerID }).count < TailcatFlowStatistics.listenerLimit {
                 let state = TCPState(key: key, phase: .synReceived,
                                      sequence: UInt32.random(in: .min ... .max), listener: listenerID)
                 state.receiveNext = sequence &+ 1
@@ -637,13 +646,19 @@ internal actor IPStack {
     }
 
     private func cancelDrain(_ id: UUID, waiter: UUID) {
-        guard let state = connections[id], let index = state.drains.firstIndex(where: { $0.0 == waiter }) else { return }
+        guard let state = connections[id] ?? closing[id], let index = state.drains.firstIndex(where: { $0.0 == waiter }) else { return }
         state.drains.remove(at: index).2.resume(throwing: CancellationError())
     }
 
     internal func closeConnection(_ id: UUID) {
         guard let state = connections[id], state.applicationClosedAt == nil else { return }
         state.applicationClosedAt = ProcessInfo.processInfo.systemUptime
+        connections[id] = nil
+        closing[id] = state
+        closingOrder.append(id)
+        if closingOrder.count > TailcatFlowStatistics.closingLimit, let oldest = closingOrder.first {
+            fail(oldest, error: TailcatTransportError.closed, reset: true)
+        }
         state.writeClosed = true
         state.buffer.removeAll()
         let reads = state.reads
@@ -665,17 +680,18 @@ internal actor IPStack {
     }
 
     private func cancelWrite(_ id: UUID, waiter: UUID) {
-        guard connections[id]?.writes.contains(where: { $0.id == waiter }) == true else { return }
+        guard (connections[id] ?? closing[id])?.writes.contains(where: { $0.id == waiter }) == true else { return }
         fail(id, error: CancellationError(), reset: true)
     }
 
     private func cancelCloseWrite(_ id: UUID, waiter: UUID) {
-        guard let state = connections[id], let index = state.closeWaiters.firstIndex(where: { $0.0 == waiter }) else { return }
+        guard let state = connections[id] ?? closing[id], let index = state.closeWaiters.firstIndex(where: { $0.0 == waiter }) else { return }
         state.closeWaiters.remove(at: index).1.resume(throwing: CancellationError())
     }
 
     private func fail(_ id: UUID, error: Error, reset: Bool = false) {
-        guard let state = connections.removeValue(forKey: id) else { return }
+        guard let state = connections.removeValue(forKey: id) ?? closing.removeValue(forKey: id) else { return }
+        closingOrder.removeAll { $0 == id }
         rememberError(id, error: error)
         flows.removeValue(forKey: state.key)
         if reset && !(state.readEOF && state.finAcknowledged) {
@@ -775,7 +791,7 @@ internal actor IPStack {
 
     private func tick() {
         let now = ProcessInfo.processInfo.systemUptime
-        for state in Array(connections.values) {
+        for state in Array(connections.values) + Array(closing.values) {
             if let finished = state.finishedAt {
                 // Retain receive buffers and TIME-WAIT state for late FINs.
                 if now - finished > 120 && state.buffer.isEmpty {
