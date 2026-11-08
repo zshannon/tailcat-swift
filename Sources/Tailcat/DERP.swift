@@ -594,8 +594,15 @@ public actor DERPTransport {
             // The server's own keepalive (type 6) comes every 60 s. A ping goes
             // only when that has gone missing, at the shared idle marks.
             while !Task.isCancelled, !closed, generation == id {
-                try await Task.sleep(nanoseconds: UInt64(IdleGrid.untilNextMark() * 1_000_000_000))
+                let planned = IdleGrid.untilNextMark(), slept = Date()
+                try await Task.sleep(nanoseconds: UInt64(planned * 1_000_000_000))
                 guard generation == id, !closed else { return }
+                let away = Date().timeIntervalSince(slept) - planned
+                if away > 5 {
+                    // Suspended: the time away is no one's silence; a check decides.
+                    lastReceived = min(lastReceived.addingTimeInterval(away), Date().addingTimeInterval(-0.001))
+                    check(); continue
+                }
                 let silent = Date().timeIntervalSince(lastReceived)
                 guard silent < 120 else { throw TransportError.timeout }
                 if silent >= 70 { try await connection.send(DERPFrame.encode(type: 0x12, payload: NaClBox.random(8))) }
