@@ -96,10 +96,21 @@ struct WireGuard: Sendable {
 
     var isEstablished: Bool { current != nil }
 
+    /// Established and still able to encrypt: an expired session must be
+    /// replaced by a handshake before anything else is sent.
+    func isUsable(now: Date = Date()) -> Bool {
+        guard let session = current else { return false }
+        return now.timeIntervalSince(session.created) < 180 && session.sendCounter < Self.rejectAfterMessages
+    }
+
     func needsRekey(now: Date = Date()) -> Bool {
         guard let session = current else { return true }
         return session.sendCounter >= (1 << 60) || now.timeIntervalSince(session.created) >= (session.initiator ? 120 : 165)
     }
+
+    #if DEBUG
+    mutating func ageForTesting(by seconds: TimeInterval) { current?.created -= seconds }
+    #endif
 
     mutating func initiate(now: Date = Date()) throws -> Data { try initiateHandshake(now: now) }
 

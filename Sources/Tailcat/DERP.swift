@@ -261,6 +261,7 @@ public actor DERPTransport {
     private var reader: Task<Void, Never>?
     private var watchdog: Task<Void, Never>?
     private var reconnect: Task<Void, Never>?
+    private var checking: Task<Void, Never>?
     private var reconnectGeneration = UUID()
     private var generation = UUID()
     private var lastReceived = Date()
@@ -366,14 +367,41 @@ public actor DERPTransport {
     public func close() {
         guard !closed else { return }
         closed = true; generation = UUID()
-        connecting?.task.cancel(); reconnect?.cancel(); reader?.cancel(); watchdog?.cancel()
+        connecting?.task.cancel(); reconnect?.cancel(); reader?.cancel(); watchdog?.cancel(); checking?.cancel()
         for waiter in rateWaiters.values { waiter.cancel() }
         stream?.close(); stream = nil
         continuation.finish()
     }
 
+    /// A network change doesn't mean this connection broke: it is checked.
+    public func notifyNetworkChanged() { check() }
+
+    /// Ping now; the connection is replaced only if nothing comes back
+    /// within `deadline` seconds. A reconnect waiting out its backoff tries now.
+    public func check(within deadline: TimeInterval = 2) {
+        guard !closed, connecting == nil else { return }
+        guard let stream else {
+            if reconnect != nil { failed(id: generation, reconnectDelay: 0) }
+            return
+        }
+        let id = generation, since = Date()
+        Task { try? await stream.send(DERPFrame.encode(type: 0x12, payload: NaClBox.random(8))) }
+        checking?.cancel()
+        checking = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await self?.checked(id: id, since: since)
+        }
+    }
+
+    private func checked(id: UUID, since: Date) {
+        guard generation == id, !closed, lastReceived < since else { return }
+        TransportDiagnostics.log("DERP silent through a check generation=\(id)")
+        failed(id: id, reconnectDelay: 0)
+    }
+
     /// Restart the relay connection without terminating its packet stream.
-    public func notifyNetworkChanged() {
+    public func reconnectNow() {
         guard !closed else { return }
         TransportDiagnostics.log("DERP reset generation=\(generation)")
         connecting?.task.cancel()

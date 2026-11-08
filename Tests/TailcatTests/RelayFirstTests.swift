@@ -160,8 +160,8 @@ final class RelayFirstTests: XCTestCase {
 
             await gate.block()
             stage = "network change"
-            await connected.notifyNetworkChanged()
-            await server.notifyNetworkChanged()
+            await connected.resetNetworkPaths()
+            await server.resetNetworkPaths()
             let resetPath = await connected.path
             XCTAssertEqual(resetPath, .relay)
             try await exchange(stream, accepted, "same encrypted stream after socket invalidation")
@@ -175,7 +175,7 @@ final class RelayFirstTests: XCTestCase {
             }
             try await exchange(stream, accepted, "same TCP stream after new network upgrade")
             stage = "one-sided socket rebind"
-            await connected.notifyNetworkChanged()
+            await connected.resetNetworkPaths()
             try await exchange(stream, accepted, "same TCP stream after only the client changes networks")
             await connected.close(); await server.close()
         } catch {
@@ -208,7 +208,7 @@ final class RelayFirstTests: XCTestCase {
         try await within { try await transport.start() }
         try await eventually { await gate.calls == 1 }
         for _ in 0..<100 {
-            await transport.notifyNetworkChanged()
+            await transport.resetNetwork()
             await transport.retryDirect()
         }
         let calls = await gate.calls
@@ -345,8 +345,8 @@ final class RelayFirstTests: XCTestCase {
                                          relayNodes: [fixture.node], relayFirst: true, discovery: discovery)
         try await transport.start()
         try await eventually { await gate.calls == 1 }
-        await transport.notifyNetworkChanged()
-        await transport.notifyNetworkChanged()
+        await transport.resetNetwork()
+        await transport.resetNetwork()
         await gate.release()
         try await eventually {
             let calls = await gate.calls, endpoints = await transport.localEndpoints()
@@ -378,7 +378,7 @@ final class RelayFirstTests: XCTestCase {
             await gate.wait()
             return Data(repeating: 0, count: 32)
         }
-        await transport.notifyNetworkChanged()
+        await transport.resetNetwork()
         try await eventually { await gate.calls == 1 }
         let sending = Task { try await transport.send(to: remote, packet: Data([4, 0, 0, 0])) }
         await transport.close()
@@ -396,7 +396,7 @@ final class RelayFirstTests: XCTestCase {
                                          relayNodes: [fixture.node], relayFirst: false, discovery: gatedDiscovery(gate))
         let starting = Task { try await transport.start() }
         try await eventually { await gate.calls == 1 }
-        await transport.notifyNetworkChanged()
+        await transport.resetNetwork()
         await gate.release()
         try await starting.value
         try await eventually { await gate.calls == 2 }
@@ -542,7 +542,7 @@ final class RelayFirstTests: XCTestCase {
             }
             try await exchange(stream, accepted, "established before peer migration")
             filter.setBlocked(true)
-            await connected.notifyNetworkChanged()
+            await connected.resetNetworkPaths()
             try await eventually { (try? await server.path(to: connected.publicKey)) == .relay }
             try await exchange(stream, accepted, "new discovery blocked; same stream must use relay")
             let blockedPath = await connected.path
@@ -584,7 +584,7 @@ final class RelayFirstTests: XCTestCase {
             try await exchange(stream, accepted, "working direct stream")
             stage = "first blocked-discovery reset"
             await gate.block()
-            await connected.notifyNetworkChanged()
+            await connected.resetNetworkPaths()
             // There is no new UDP socket, address announcement or matching Pong.
             // The ordered encrypted reset marker must make replies use DERP.
             try await exchange(stream, accepted, "relay traffic before any new endpoint hint")
@@ -600,7 +600,7 @@ final class RelayFirstTests: XCTestCase {
             // A rapid second asymmetric change must still recover, even with
             // all new UDP/endpoint hints blocked.
             await gate.block()
-            await connected.notifyNetworkChanged()
+            await connected.resetNetworkPaths()
             stage = "rapid second reset"
             try await within(5) {
                 try await self.exchange(stream, accepted, "another rapid rebind without discovery")
@@ -635,7 +635,7 @@ final class RelayFirstTests: XCTestCase {
                 throw TransportError.closed
             }
             await gate.block()
-            await connected.notifyNetworkChanged()
+            await connected.resetNetworkPaths()
             stage = "third reset"
             try await exchange(stream, accepted, "a later one-sided rebind still falls back")
             let repeatedResponsePath = try await server.path(to: connected.publicKey)
@@ -646,6 +646,108 @@ final class RelayFirstTests: XCTestCase {
             XCTFail("Marker recovery failed during \(stage): \(error)")
             await gate.release(); await client?.close(); await server.close(); throw error
         }
+    }
+
+    private func wakePair(_ fixture: LocalRelay, port: UInt16, client clientDiscovery: DirectDiscovery? = nil) async throws
+        -> (server: TailcatServer, client: TailcatClient, stream: TailcatConnection, accepted: TailcatConnection) {
+        var serverConfig = TailcatServer.Configuration()
+        serverConfig.relayFirst = true
+        serverConfig.region = DERPRegion(regionID: 1, nodes: [fixture.node])
+        serverConfig.directDiscovery = loopbackDiscovery()
+        let server = TailcatServer(configuration: serverConfig)
+        let listener = try await server.listen(port: port)
+        var config = TailcatClient.Configuration()
+        config.relayFirst = true; config.directDiscovery = clientDiscovery ?? loopbackDiscovery()
+        let client = try await TailcatClient.connect(to: server.address, configuration: config)
+        let stream = try await client.openTCP(port: port)
+        return (server, client, stream, try await listener.accept())
+    }
+
+    func testWakeAndNetworkChangeKeepTheRelayRouteAndSessionThatAnswer() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        let pair = try await wakePair(fixture, port: 8090)
+        do {
+            try await eventually {
+                if case .direct = await pair.client.path,
+                   case .direct = try? await pair.server.path(to: pair.client.publicKey) { return true }
+                return false
+            }
+            try await exchange(pair.stream, pair.accepted, "direct before waking")
+            let route = await pair.client.path
+            let connections = fixture.authenticatedConnections, initiations = fixture.relayedInitiations
+            await pair.client.wake()
+            try await Task.sleep(nanoseconds: 2_500_000_000)
+            try await exchange(pair.stream, pair.accepted, "same stream after waking with nothing broken")
+            await pair.client.notifyNetworkChanged()
+            try await Task.sleep(nanoseconds: 2_500_000_000)
+            try await exchange(pair.stream, pair.accepted, "same stream after a network change that broke nothing")
+            let after = await pair.client.path
+            XCTAssertEqual(after, route, "A direct route that answers is kept")
+            XCTAssertEqual(fixture.authenticatedConnections, connections, "So is the relay connection")
+            XCTAssertEqual(fixture.relayedInitiations, initiations, "And the session")
+            await pair.client.close(); await pair.server.close()
+        } catch { await pair.client.close(); await pair.server.close(); throw error }
+    }
+
+    func testWakeReplacesASilentRelayWithinItsDeadlineAndKeepsTheSession() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        let gate = DiscoveryGate() // No UDP: the relay is the only way.
+        let pair = try await wakePair(fixture, port: 8091, client: gatedDiscovery(gate))
+        do {
+            try await exchange(pair.stream, pair.accepted, "relay before waking")
+            let connections = fixture.authenticatedConnections, initiations = fixture.relayedInitiations
+            fixture.silence(await pair.client.publicKey.rawValue)
+            let woke = Date()
+            await pair.client.wake()
+            try await eventually { fixture.authenticatedConnections > connections }
+            let elapsed = Date().timeIntervalSince(woke)
+            print("SILENT-RELAY-RECOVERY \(Int(elapsed * 1000))ms")
+            XCTAssertGreaterThanOrEqual(elapsed, 1.9); XCTAssertLessThan(elapsed, 3.5)
+            try await exchange(pair.stream, pair.accepted, "same stream over the replaced relay")
+            XCTAssertEqual(fixture.relayedInitiations, initiations, "The session is kept")
+            await gate.release(); await pair.client.close(); await pair.server.close()
+        } catch { await gate.release(); await pair.client.close(); await pair.server.close(); throw error }
+    }
+
+    func testWakeDropsADirectRouteThatStoppedAnswering() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        let filter = DiscoveryPacketFilter()
+        var discovery = loopbackDiscovery()
+        discovery.open = { receive in try UDPChannel { packet, endpoint in if !filter.drops(packet) { receive(packet, endpoint) } } }
+        let pair = try await wakePair(fixture, port: 8092, client: discovery)
+        do {
+            try await eventually {
+                if case .direct = await pair.client.path,
+                   case .direct = try? await pair.server.path(to: pair.client.publicKey) { return true }
+                return false
+            }
+            filter.setBlocked(true)
+            await pair.client.wake()
+            try await Task.sleep(nanoseconds: 1_500_000_000)
+            let during = await pair.client.path
+            guard case .direct = during else { XCTFail("Dropped before its deadline"); throw TransportError.closed }
+            try await eventually { await pair.client.path == .relay }
+            try await exchange(pair.stream, pair.accepted, "same stream over the relay")
+            await pair.client.close(); await pair.server.close()
+        } catch { await pair.client.close(); await pair.server.close(); throw error }
+    }
+
+    func testAnExpiredSessionHandshakesAtTheFirstSendNotTheNextIdleMark() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        let gate = DiscoveryGate()
+        let pair = try await wakePair(fixture, port: 8093, client: gatedDiscovery(gate))
+        do {
+            try await exchange(pair.stream, pair.accepted, "before the suspension")
+            let initiations = fixture.relayedInitiations
+            await pair.client.ageForTesting(by: 181)
+            let sent = Date()
+            try await exchange(pair.stream, pair.accepted, "first send after the session expired")
+            let elapsed = Date().timeIntervalSince(sent)
+            print("EXPIRED-SESSION-FIRST-ECHO \(Int(elapsed * 1000))ms")
+            XCTAssertLessThan(elapsed, 2, "Rekeyed at once")
+            XCTAssertEqual(fixture.relayedInitiations, initiations + 1)
+            await gate.release(); await pair.client.close(); await pair.server.close()
+        } catch { await gate.release(); await pair.client.close(); await pair.server.close(); throw error }
     }
 }
 #endif

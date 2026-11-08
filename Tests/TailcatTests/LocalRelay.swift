@@ -59,11 +59,18 @@ final class LocalRelay: @unchecked Sendable {
     private let privateKey = NaClBox.random(32)
     private let fastStartBehavior: FastStartBehavior
     private var fastStarts = 0
+    private var silent = Set<ObjectIdentifier>()
+    private var authenticated = 0
+    private var initiations = 0
     private var clientNonces = [Data]()
 
     var serverPublicKey: Data { get throws { try NaClBox.publicKey(for: privateKey) } }
     var fastStartCount: Int { lock.lock(); defer { lock.unlock() }; return fastStarts }
     var authenticationNonces: [Data] { lock.lock(); defer { lock.unlock() }; return clientNonces }
+    /// Relay connections that got through authentication.
+    var authenticatedConnections: Int { lock.lock(); defer { lock.unlock() }; return authenticated }
+    /// WireGuard handshake initiations relayed.
+    var relayedInitiations: Int { lock.lock(); defer { lock.unlock() }; return initiations }
 
     init(fastStartBehavior: FastStartBehavior = .supported) throws {
         self.fastStartBehavior = fastStartBehavior
@@ -139,7 +146,7 @@ final class LocalRelay: @unchecked Sendable {
             lock.lock(); clientNonces.append(nonce); lock.unlock()
             _ = try NaClBox.open(Data(auth.payload.dropFirst(56)), nonce: nonce, publicKey: key, privateKey: privateKey)
             identity = key
-            lock.lock(); peers[key] = connection; lock.unlock()
+            lock.lock(); peers[key] = connection; authenticated += 1; lock.unlock()
             let responseNonce = NaClBox.random(24)
             var info = try NaClBox.seal(Data("{\"version\":2}".utf8), nonce: responseNonce, publicKey: key, privateKey: privateKey)
             if fastStartBehavior == .corruptServerInfo { info[0] ^= 1 }
@@ -149,6 +156,8 @@ final class LocalRelay: @unchecked Sendable {
             try connection.send(fast && fastStartBehavior != .ignored ? greeting + serverInfo : serverInfo)
             while true {
                 let frame = try connection.frame()
+                lock.lock(); let muted = silent.contains(ObjectIdentifier(connection)); lock.unlock()
+                if muted { continue }
                 if frame.type == 4, frame.payload.count >= 32 {
                     let destination = Data(frame.payload.prefix(32))
                     lock.lock()
@@ -156,8 +165,9 @@ final class LocalRelay: @unchecked Sendable {
                     if let type = WireGuard.packetType(packet) {
                         wireGuardTypes.insert(type)
                         if type == 4, packet.count == 32 { keepalives[key] = packet }
+                        if type == 1 { initiations += 1 }
                     }
-                    let target = peers[destination]; lock.unlock()
+                    let target = peers[destination].flatMap { silent.contains(ObjectIdentifier($0)) ? nil : $0 }; lock.unlock()
                     try? target?.send(DERPFrame.encode(type: 5, payload: key + frame.payload.dropFirst(32)))
                 } else if frame.type == 0x12 {
                     try connection.send(DERPFrame.encode(type: 0x13, payload: frame.payload))
@@ -180,6 +190,12 @@ final class LocalRelay: @unchecked Sendable {
     func inject(_ packet: Data, from source: Data, to destination: Data) throws {
         lock.lock(); let target = peers[destination]; lock.unlock()
         try target?.send(DERPFrame.encode(type: 5, payload: source + packet))
+    }
+
+    /// The source's current connection goes silent, as one that died without
+    /// a reset: frames are read and dropped and nothing goes out on it.
+    func silence(_ source: Data) {
+        lock.lock(); if let connection = peers[source] { silent.insert(ObjectIdentifier(connection)) }; lock.unlock()
     }
 
     func dropConnections() {

@@ -94,9 +94,14 @@ public actor TailcatServer {
     }
     /// Probe without dropping an existing route or encrypted session. Nil targets all peers.
     public func retryDirect(to key: NodePublicKey? = nil) async { await engine?.retryDirect(to: key) }
-    /// Discard old network paths, rebind UDP and reconnect DERP, preserving encrypted sessions.
-    public func notifyNetworkChanged() async { await engine?.notifyNetworkChanged() }
-    public func resetNetworkPaths() async { await notifyNetworkChanged() }
+    /// Back from a suspension: DERP and every direct path are checked, and
+    /// only what doesn't answer within two seconds is replaced.
+    public func wake() async { await engine?.wake() }
+    /// A network change doesn't mean the old connections broke: the same check as `wake`.
+    public func notifyNetworkChanged() async { await engine?.wake() }
+    /// Forced reset: discard old network paths, rebind UDP and reconnect DERP, preserving encrypted sessions.
+    /// Only when the sockets are known unusable.
+    public func resetNetworkPaths() async { await engine?.resetNetwork() }
     /// The server's own TCP flows (its listeners' and those it opened);
     /// zero before it starts. Forwarded flows are not counted.
     public var flowStatistics: TailcatFlowStatistics {
@@ -186,8 +191,19 @@ public actor TailcatClient {
     public var path: ConnectionPath { get async { await engine.path(to: serverAddress.serverPublicKey) } }
     /// Request a background probe without disrupting the current route or session.
     public func retryDirect() async { await engine.retryDirect(to: serverAddress.serverPublicKey) }
-    public func notifyNetworkChanged() async { await engine.notifyNetworkChanged() }
-    public func resetNetworkPaths() async { await notifyNetworkChanged() }
+    /// Back from a suspension: DERP and every direct path are checked, and
+    /// only what doesn't answer within two seconds is replaced. The session
+    /// and a route that still works are kept; an expired session rekeys at
+    /// the next send.
+    public func wake() async { await engine.wake() }
+    /// A network change doesn't mean the old connections broke: the same check as `wake`.
+    public func notifyNetworkChanged() async { await engine.wake() }
+    /// Forced reset: discard old network paths, rebind UDP and reconnect DERP, preserving the session.
+    /// Only when the sockets are known unusable.
+    public func resetNetworkPaths() async { await engine.resetNetwork() }
+    #if DEBUG
+    func ageForTesting(by seconds: TimeInterval) async { await engine.ageForTesting(by: seconds) }
+    #endif
     /// This client's TCP flows to the server, open and closing, against
     /// the budgets in `TailcatFlowStatistics`.
     public var flowStatistics: TailcatFlowStatistics { get async { await engine.flowStatistics() } }
@@ -280,7 +296,7 @@ internal actor TailcatEngine {
         guard !server, !closed else { return 1 }
         let now = Date()
         let busy = peers.values.contains {
-            !$0.acknowledged || !$0.wireguard.isEstablished || !$0.pending.isEmpty || now.timeIntervalSince($0.lastActivity) < Self.idleAfter
+            !$0.acknowledged || !$0.wireguard.isUsable(now: now) || !$0.pending.isEmpty || now.timeIntervalSince($0.lastActivity) < Self.idleAfter
         }
         return busy ? 1 : IdleGrid.untilNextMark()
     }
@@ -365,7 +381,20 @@ internal actor TailcatEngine {
     }
     func path(to key: NodePublicKey) async -> ConnectionPath { await network.path(to: key.rawValue) }
     func retryDirect(to key: NodePublicKey?) async { await network.retryDirect(to: key?.rawValue) }
-    func notifyNetworkChanged() async { await network.notifyNetworkChanged() }
+    /// The tick handshakes at once if the session expired while suspended.
+    func wake() async { await network.wake(); await tick() }
+    func resetNetwork() async { await network.resetNetwork() }
+    #if DEBUG
+    /// As if suspended for `seconds`: sessions and activity are that much older.
+    func ageForTesting(by seconds: TimeInterval) {
+        for node in Array(peers.keys) {
+            guard var peer = peers[node] else { continue }
+            peer.wireguard.ageForTesting(by: seconds)
+            peer.lastActivity -= seconds; peer.lastSend -= seconds; peer.lastReceived -= seconds; peer.lastHandshake -= seconds
+            peers[node] = peer
+        }
+    }
+    #endif
     func flowStatistics() async -> TailcatFlowStatistics {
         guard let stack else { return TailcatFlowStatistics(open: 0, closing: 0) }
         return await stack.flowStatistics
@@ -492,7 +521,9 @@ internal actor TailcatEngine {
         if server, targets[Data(packet[8..<24])] != nil { targetActivity[Data(packet[8..<24])] = Date() }
         let node = identity.rawValue
         guard var peer = peers[node] else { throw TailcatError.peerRejected }
-        if peer.wireguard.isEstablished { try await sendPayload(packet, to: node) }
+        // An expired session queues too: the tick below handshakes at once,
+        // rather than at the next idle mark.
+        if peer.wireguard.isUsable() { try await sendPayload(packet, to: node) }
         else {
             guard peer.pendingBytes + packet.count <= 262_144 else { throw TailcatError.bufferFull }
             peer.pending.append(packet); peer.pendingBytes += packet.count; peers[node] = peer
@@ -590,7 +621,7 @@ internal actor TailcatEngine {
         Task { await handler(connection) }
     }
     private func makeRelayResetMarker(to node: Data) throws -> Data? {
-        guard !closed, var peer = peers[node], peer.authenticated, peer.wireguard.isEstablished else { return nil }
+        guard !closed, var peer = peers[node], peer.authenticated, peer.wireguard.isUsable() else { return nil }
         var encrypted = try peer.wireguard.encrypt(Data())
         if encrypted[8..<16].allSatisfy({ $0 == 0 }) {
             // Counter zero remains a key-confirmation packet, even if reset
@@ -610,7 +641,7 @@ internal actor TailcatEngine {
         try await network.send(to: node, packet: encrypted)
     }
     private func flush(_ node: Data) async {
-        guard var peer = peers[node], peer.wireguard.isEstablished else { return }
+        guard var peer = peers[node], peer.wireguard.isUsable() else { return }
         let pending = peer.pending; peer.pending.removeAll(); peer.pendingBytes = 0; peers[node] = peer
         for packet in pending { try? await sendPayload(packet, to: node) }
     }
@@ -653,14 +684,14 @@ internal actor TailcatEngine {
             let idle = !server && now.timeIntervalSince(peer.lastActivity) >= Self.idleAfter
             let due = !idle || IdleGrid.atMark()
             do {
-            if (!peer.wireguard.isEstablished || (peer.wireguard.needsRekey(now: now) && due)), now.timeIntervalSince(peer.lastHandshake) >= 5 {
+            if (!peer.wireguard.isUsable(now: now) || (peer.wireguard.needsRekey(now: now) && due)), now.timeIntervalSince(peer.lastHandshake) >= 5 {
                 // Clients initiate the first handshake. Either endpoint may rekey established sessions.
                 if server && !peer.wireguard.isEstablished { continue }
                 let handshake = try peer.wireguard.initiateHandshake(now: now)
                 peer.lastHandshake = now; peers[node] = peer
                 startupTrace?.record("wireGuardInitiationSendStarted")
                 try await network.send(to: node, packet: handshake)
-            } else if peer.wireguard.isEstablished, due, now.timeIntervalSince(peer.lastSend) >= (idle ? Self.idleKeepalive : 25) { try await sendPayload(Data(), to: node) }
+            } else if peer.wireguard.isUsable(now: now), due, now.timeIntervalSince(peer.lastSend) >= (idle ? Self.idleKeepalive : 25) { try await sendPayload(Data(), to: node) }
             } catch { if !server { throw error } }
         }
     }

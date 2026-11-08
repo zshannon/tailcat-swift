@@ -124,7 +124,7 @@ public enum TailcatBenchmark {
             if recover {
                 sample.recoveryPathBefore = path(await client.path)
                 let reset = now()
-                await client.notifyNetworkChanged()
+                await client.resetNetworkPaths()
                 let recoveryObservation = Task { try await observeDirect(client, start: reset) }
                 defer { recoveryObservation.cancel() }
                 for sequence in 0..<10 {

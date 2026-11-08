@@ -99,7 +99,7 @@ final class DERPHandshakeTests: XCTestCase {
             XCTAssertEqual(names.filter { $0 == "serverInfoVerified" }.count, 1)
             XCTAssertEqual(fixture.authenticationNonces.count, 2)
             XCTAssertNotEqual(fixture.authenticationNonces.first, fixture.authenticationNonces.last)
-            await transport.notifyNetworkChanged()
+            await transport.reconnectNow()
             try await transport.connect()
             XCTAssertEqual(fixture.fastStartCount, 1, "a bad capability stays disabled for this transport")
             await transport.close(); fixture.close()

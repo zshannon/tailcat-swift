@@ -180,7 +180,7 @@ final class StartupTraceTests: XCTestCase {
                 XCTAssertLessThan(try XCTUnwrap(names.firstIndex(of: "serverInfoVerified")), try XCTUnwrap(names.firstIndex(of: "wireGuardEstablished")))
                 XCTAssertLessThan(try XCTUnwrap(names.firstIndex(of: "wireGuardEstablished")), try XCTUnwrap(names.firstIndex(of: "connectReturned")))
             }
-            await second.notifyNetworkChanged()
+            await second.resetNetworkPaths()
             try await echo(firstStream, "first survives another client's reset")
             try await echo(secondStream, "second keeps its own flow across reset")
             await first.close()

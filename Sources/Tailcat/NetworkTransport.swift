@@ -65,6 +65,9 @@ struct UDPIngress: Sendable {
     func finish() { continuation.finish() }
 }
 
+/// The UDP socket can no longer send, whatever the destination.
+struct UDPSocketFailure: Error { let code: Int32 }
+
 /// A single dual-stack socket keeps STUN, discovery and WireGuard on the same NAT mapping.
 final class UDPChannel: @unchecked Sendable {
     let port: UInt16
@@ -227,15 +230,21 @@ final class UDPChannel: @unchecked Sendable {
                         }
                     }
                 }
+                let error = errno
                 let finished = ProcessInfo.processInfo.systemUptime
                 if isDiscovery || finished - executing > 0.01 { TransportDiagnostics.log("UDP complete port=\(port) to=\(endpoint) syscallMs=\((finished - executing) * 1000) count=\(count)") }
                 if count == packet.count { continuation.resume() }
-                else { continuation.resume(throwing: TransportError.connectionFailed("UDP send: \(errno)")) }
+                else if Self.socketFailures.contains(error) { continuation.resume(throwing: UDPSocketFailure(code: error)) }
+                else { continuation.resume(throwing: TransportError.connectionFailed("UDP send: \(error)")) }
             }
         }
     }
 
     func close() { queue.async { [self] in closed = true; source.cancel() } }
+
+    /// Errors of the socket itself, as when iOS reclaims the sockets of a
+    /// suspended app, rather than of a route: only these replace the socket.
+    static let socketFailures: Set<Int32> = [EPIPE, EBADF, ENOTCONN, ENOTSOCK]
 
     func interfaceEndpoints() -> [DiscoveryEndpoint] {
         var list: UnsafeMutablePointer<ifaddrs>?
@@ -309,6 +318,8 @@ public actor NetworkTransport {
     private var relayReader: Task<Void, Never>?
     private var maintenance: Task<Void, Never>?
     private var starting: Task<Void, Error>?
+    private var directCheck: Task<Void, Never>?
+    private var lastRebind = Date.distantPast
     private var started = false
     private var closed = false
     private struct Peer {
@@ -412,7 +423,7 @@ public actor NetworkTransport {
             scheduleDiscovery()
             if pendingNetworkChange {
                 pendingNetworkChange = false
-                notifyNetworkChanged()
+                resetNetwork()
             }
         } catch {
             udpIngress?.finish(); udpIngress = nil; udpReader?.cancel(); udpReader = nil
@@ -520,7 +531,7 @@ public actor NetworkTransport {
         pathSignature = signature
         guard let previous, previous != signature else { return }
         TransportDiagnostics.log("OS path changed old=\(previous) new=\(signature)")
-        notifyNetworkChanged()
+        wake()
     }
     #endif
 
@@ -636,9 +647,70 @@ public actor NetworkTransport {
         }
     }
 
-    /// Invalidate old candidates and socket callbacks before beginning network recovery.
-    public func notifyNetworkChanged() {
-        TransportDiagnostics.log("notifyNetworkChanged started=\(started) pending=\(resetTask != nil) udp=\(udp?.port ?? 0)")
+    /// After a suspension or a network change. Neither means the old
+    /// connections broke, so each is checked and only what doesn't answer
+    /// within `deadline` seconds is replaced: DERP is pinged and reconnected
+    /// only if silent, every candidate is probed and the selected direct
+    /// route is dropped only if its own Pong doesn't come back, and addresses
+    /// are advertised again. The socket and sessions stay.
+    public func wake(within deadline: TimeInterval = 2) {
+        guard started, !closed, resetTask == nil else { return }
+        TransportDiagnostics.log("wake udp=\(udp?.port ?? 0)")
+        let since = Date()
+        scheduleDiscovery()
+        for key in peers.keys {
+            peers[key]?.lastCall = .distantPast
+            scheduleProbe(key, force: true); scheduleInvitation(key)
+        }
+        directCheck?.cancel()
+        directCheck = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await self?.checkDirect(since: since)
+        }
+        Task { [relay] in await relay.check(within: deadline) }
+    }
+
+    /// A network change is checked, not assumed to have broken anything; see `wake`.
+    public func notifyNetworkChanged() { wake() }
+
+    private func checkDirect(since: Date) {
+        guard !closed else { return }
+        for (key, peer) in peers where peer.direct != nil && peer.verified < since {
+            TransportDiagnostics.log("direct route silent through a check; fallback relay old=\(peer.direct?.description ?? "")")
+            invalidateDirectPath(to: key)
+            requestRelayMarker(to: key)
+            Task { [weak self] in try? await self?.sendPendingRelayMarker(to: key) }
+            scheduleProbe(key, force: true)
+        }
+    }
+
+    /// The socket itself failed: only it is replaced, on a new port. Remote
+    /// candidates, the relay and sessions stay.
+    private func socketFailed(_ error: Error, on channel: UDPChannel) {
+        guard error is UDPSocketFailure, !closed, started, udp === channel, resetTask == nil,
+              Date().timeIntervalSince(lastRebind) >= 5 else { return }
+        TransportDiagnostics.log("UDP socket failed port=\(channel.port) error=\(error); rebinding")
+        lastRebind = Date()
+        networkGeneration = UUID()
+        for key in peers.keys {
+            if peers[key]?.direct != nil {
+                requestRelayMarker(to: key)
+                Task { [weak self] in try? await self?.sendPendingRelayMarker(to: key) }
+            }
+            invalidateDirectPath(to: key)
+            peers[key]?.lastCall = .distantPast
+        }
+        discoveryTask?.cancel()
+        udpIngress?.finish(); udpIngress = nil; udpReader?.cancel(); udpReader = nil
+        udp?.close(); udp = nil
+        scheduleDiscovery()
+    }
+
+    /// Forced reset: old candidates go, UDP rebinds and DERP reconnects.
+    /// Only for sockets known unusable; a network change is `wake`.
+    public func resetNetwork() {
+        TransportDiagnostics.log("resetNetwork started=\(started) pending=\(resetTask != nil) udp=\(udp?.port ?? 0)")
         guard !closed else { return }
         guard started, resetTask == nil else {
             pendingNetworkChange = true
@@ -652,7 +724,7 @@ public actor NetworkTransport {
         udp?.close(); udp = nil; interfaceEndpoints.removeAll(); stunServers.removeAll()
         let generation = networkGeneration
         resetTask = Task { [weak self, relay] in
-            await relay.notifyNetworkChanged()
+            await relay.reconnectNow()
             await self?.finishNetworkReset(generation: generation)
         }
     }
@@ -662,7 +734,7 @@ public actor NetworkTransport {
         resetTask = nil
         if pendingNetworkChange {
             pendingNetworkChange = false
-            notifyNetworkChanged()
+            resetNetwork()
         } else {
             scheduleDiscovery()
             for key in relayMarkers.keys {
@@ -748,6 +820,7 @@ public actor NetworkTransport {
                     invalidateDirectPath(to: nodeKey)
                     requestRelayMarker(to: nodeKey)
                 }
+                socketFailed(error, on: udp)
             }
         }
         if let peer = peers[nodeKey], peer.direct != nil, Date().timeIntervalSince(peer.verified) >= Self.directLifetime {
@@ -795,7 +868,7 @@ public actor NetworkTransport {
     public func close() async {
         guard !closed else { return }
         closed = true; started = false
-        starting?.cancel(); relayReader?.cancel(); maintenance?.cancel()
+        starting?.cancel(); relayReader?.cancel(); maintenance?.cancel(); directCheck?.cancel()
         discoveryTask?.cancel(); discoveryTask = nil; resetTask?.cancel(); resetTask = nil
         networkGeneration = UUID(); stunDiscoveryGeneration = UUID()
         for task in probeTasks.values { task.cancel() }; probeTasks.removeAll()
@@ -1032,7 +1105,7 @@ public actor NetworkTransport {
             guard let packet = try? await sealDiscovery(.ping(transaction: transaction, nodeKey: nodePublic), to: peer.discoKey) else { continue }
             guard !closed, !Task.isCancelled, peers[key]?.generation == peer.generation else { return }
             probes[transaction] = Probe(peer: key, endpoint: endpoint, sent: Date(), generation: peer.generation)
-            try? await udp.send(packet, to: endpoint)
+            do { try await udp.send(packet, to: endpoint) } catch { socketFailed(error, on: udp); if error is UDPSocketFailure { return } }
         }
     }
 
