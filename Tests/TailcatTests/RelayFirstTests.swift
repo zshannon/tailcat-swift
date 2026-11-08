@@ -732,6 +732,25 @@ final class RelayFirstTests: XCTestCase {
         } catch { await pair.client.close(); await pair.server.close(); throw error }
     }
 
+    func testALostInitiationIsRetriedWithinASecondWhileDataWaits() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        let gate = DiscoveryGate()
+        let pair = try await wakePair(fixture, port: 8094, client: gatedDiscovery(gate))
+        do {
+            try await exchange(pair.stream, pair.accepted, "before the suspension")
+            let initiations = fixture.relayedInitiations
+            await pair.client.ageForTesting(by: 181)
+            fixture.dropInitiations(1)
+            let sent = Date()
+            try await exchange(pair.stream, pair.accepted, "first send after the session expired")
+            let elapsed = Date().timeIntervalSince(sent)
+            print("LOST-INITIATION-FIRST-ECHO \(Int(elapsed * 1000))ms")
+            XCTAssertLessThan(elapsed, 2.5, "Not held for the five-second retry")
+            XCTAssertEqual(fixture.relayedInitiations, initiations + 2)
+            await gate.release(); await pair.client.close(); await pair.server.close()
+        } catch { await gate.release(); await pair.client.close(); await pair.server.close(); throw error }
+    }
+
     func testAnExpiredSessionHandshakesAtTheFirstSendNotTheNextIdleMark() async throws {
         let fixture = try LocalRelay(); defer { fixture.close() }
         let gate = DiscoveryGate()

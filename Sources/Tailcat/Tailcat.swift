@@ -244,6 +244,8 @@ internal actor TailcatEngine {
         var acknowledged = false
         var lastMeow = Date.distantPast
         var lastHandshake = Date.distantPast
+        /// Woken with an expired session: rekey at the next tick, before anything is sent.
+        var rekeyNow = false
         var lastSend = Date()
         var pending: [Data] = []
         var pendingBytes = 0
@@ -296,7 +298,7 @@ internal actor TailcatEngine {
         guard !server, !closed else { return 1 }
         let now = Date()
         let busy = peers.values.contains {
-            !$0.acknowledged || !$0.wireguard.isUsable(now: now) || !$0.pending.isEmpty || now.timeIntervalSince($0.lastActivity) < Self.idleAfter
+            !$0.acknowledged || !$0.wireguard.isEstablished || !$0.pending.isEmpty || now.timeIntervalSince($0.lastActivity) < Self.idleAfter
         }
         return busy ? 1 : IdleGrid.untilNextMark()
     }
@@ -381,8 +383,15 @@ internal actor TailcatEngine {
     }
     func path(to key: NodePublicKey) async -> ConnectionPath { await network.path(to: key.rawValue) }
     func retryDirect(to key: NodePublicKey?) async { await network.retryDirect(to: key?.rawValue) }
-    /// The tick handshakes at once if the session expired while suspended.
-    func wake() async { await network.wake(); await tick() }
+    /// A session that expired while suspended rekeys at once, and an
+    /// initiation sent before this may have gone into a dead connection.
+    func wake() async {
+        await network.wake()
+        for node in Array(peers.keys) where peers[node]?.wireguard.isUsable() == false {
+            peers[node]?.rekeyNow = true; peers[node]?.lastHandshake = .distantPast
+        }
+        await tick()
+    }
     func resetNetwork() async { await network.resetNetwork() }
     #if DEBUG
     /// As if suspended for `seconds`: sessions and activity are that much older.
@@ -684,11 +693,16 @@ internal actor TailcatEngine {
             let idle = !server && now.timeIntervalSince(peer.lastActivity) >= Self.idleAfter
             let due = !idle || IdleGrid.atMark()
             do {
-            if (!peer.wireguard.isUsable(now: now) || (peer.wireguard.needsRekey(now: now) && due)), now.timeIntervalSince(peer.lastHandshake) >= 5 {
+            // Data waiting on an expired session handshakes at once, and retries each second rather
+            // than five: an initiation lost to a relay that died during a suspension would otherwise
+            // hold that data for five seconds. An idle expired session waits for the next mark.
+            let waiting = !peer.wireguard.isUsable(now: now) && (!peer.pending.isEmpty || peer.rekeyNow)
+            if (!peer.wireguard.isEstablished || waiting || (peer.wireguard.needsRekey(now: now) && due)),
+               now.timeIntervalSince(peer.lastHandshake) >= (waiting ? 1 : 5) {
                 // Clients initiate the first handshake. Either endpoint may rekey established sessions.
                 if server && !peer.wireguard.isEstablished { continue }
                 let handshake = try peer.wireguard.initiateHandshake(now: now)
-                peer.lastHandshake = now; peers[node] = peer
+                peer.lastHandshake = now; peer.rekeyNow = false; peers[node] = peer
                 startupTrace?.record("wireGuardInitiationSendStarted")
                 try await network.send(to: node, packet: handshake)
             } else if peer.wireguard.isUsable(now: now), due, now.timeIntervalSince(peer.lastSend) >= (idle ? Self.idleKeepalive : 25) { try await sendPayload(Data(), to: node) }
