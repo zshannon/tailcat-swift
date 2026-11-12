@@ -267,6 +267,7 @@ internal actor TailcatEngine {
     private var peers: [Data: Peer] = [:]
     private var admitting: [Data: (UUID, Task<Void, Never>)] = [:]
     private var reader: Task<Void, Never>?
+    private var recoveries: Task<Void, Never>?
     private var timer: Task<Void, Never>?
     private var connectionWaiter: (id: UUID, continuation: CheckedContinuation<Void, Error>)?
     private var connectionDeadline: Task<Void, Never>?
@@ -331,6 +332,9 @@ internal actor TailcatEngine {
         reader = Task { [weak self, network] in
             do { for try await packet in network.packets { await self?.receive(packet) } }
             catch { await self?.close() }
+        }
+        recoveries = Task { [weak self, network] in
+            for await _ in network.relayRecoveries { await self?.relayRecovered() }
         }
         timer = Task { [weak self] in
             var delay: TimeInterval = 1
@@ -443,6 +447,7 @@ internal actor TailcatEngine {
         await tick()
     }
     func resetNetwork() async { await network.resetNetwork() }
+    private func relayRecovered() async { await stack?.resendOwed() }
     #if DEBUG
     /// As if suspended for `seconds`: sessions and activity are that much older.
     func ageForTesting(by seconds: TimeInterval) {
@@ -469,7 +474,7 @@ internal actor TailcatEngine {
     func close() async {
         guard !closed else { return }; closed = true
         finishConnection(.failure(TailcatError.closed))
-        reader?.cancel(); timer?.cancel(); selectedTCPHandlers.removeAll()
+        reader?.cancel(); recoveries?.cancel(); timer?.cancel(); selectedTCPHandlers.removeAll()
         for (_, task) in admitting.values { task.cancel() }; admitting.removeAll()
         for task in handlerTasks.values { task.cancel() }; handlerTasks.removeAll()
         for listener in handlerUDP.values { await listener.close() }; handlerUDP.removeAll(); handlerTCP.removeAll()

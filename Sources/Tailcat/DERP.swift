@@ -259,6 +259,16 @@ private final class DERPStream: @unchecked Sendable {
 public actor DERPTransport {
     public nonisolated let packets: AsyncThrowingStream<DERPPacket, Error>
     private let continuation: AsyncThrowingStream<DERPPacket, Error>.Continuation
+    /// Each time the connection is up again after one failed or was found
+    /// silent by a check; not on the first connect. What went out the old
+    /// connection meanwhile was lost, and is owed again.
+    public nonisolated let recoveries: AsyncStream<Void>
+    private let recovered: AsyncStream<Void>.Continuation
+    private var recovering = false
+    /// The relay's round trip, smoothed (RFC 6298's 1/8): from each
+    /// connection's upgrade to its greeting, and from our pings to their pongs.
+    private var smoothedRTT: TimeInterval?
+    private var pings = [Data: TimeInterval]()
     private let nodes: [DERPNode]
     private var nodeIndex = 0
     private let privateKey: Data
@@ -310,6 +320,7 @@ public actor DERPTransport {
         var output: AsyncThrowingStream<DERPPacket, Error>.Continuation!
         packets = AsyncThrowingStream(bufferingPolicy: .bufferingNewest(256)) { output = $0 }
         continuation = output
+        (recoveries, recovered) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
     }
 
     public func connect() async throws {
@@ -380,13 +391,17 @@ public actor DERPTransport {
         for waiter in rateWaiters.values { waiter.cancel() }
         stream?.close(); stream = nil
         continuation.finish()
+        recovered.finish()
     }
 
     /// A network change doesn't mean this connection broke: it is checked.
     public func notifyNetworkChanged() { check() }
 
-    /// Ping now; the connection is replaced only if nothing comes back
-    /// within `deadline` seconds. A reconnect waiting out its backoff tries now.
+    /// Ping now; the connection is replaced only if nothing comes back in
+    /// time: three of its round trips, at least a second, or before one is
+    /// measured `deadline` seconds, at most 1.5. Anything heard counts, so a
+    /// busy connection whose pong queues behind its traffic stays. A
+    /// reconnect waiting out its backoff tries now.
     public func check(within deadline: TimeInterval = 2) {
         guard !closed, connecting == nil else { return }
         guard let stream else {
@@ -394,13 +409,25 @@ public actor DERPTransport {
             return
         }
         let id = generation, since = Date()
-        Task { try? await stream.send(DERPFrame.encode(type: 0x12, payload: NaClBox.random(8))) }
+        let deadline = smoothedRTT.map { max(1, 3 * $0) } ?? min(deadline, 1.5)
+        let ping = NaClBox.random(8)
+        pinged(ping)
+        Task { try? await stream.send(DERPFrame.encode(type: 0x12, payload: ping)) }
         checking?.cancel()
         checking = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))
             guard !Task.isCancelled else { return }
             await self?.checked(id: id, since: since)
         }
+    }
+
+    private func pinged(_ payload: Data) {
+        if pings.count >= 8 { pings.removeAll() }
+        pings[payload] = ProcessInfo.processInfo.systemUptime
+    }
+
+    private func sampleRTT(_ sample: TimeInterval) {
+        smoothedRTT = smoothedRTT.map { 0.875 * $0 + 0.125 * sample } ?? sample
     }
 
     private func checked(id: UUID, since: Date) {
@@ -506,6 +533,7 @@ public actor DERPTransport {
                 startupTrace?.record("derpFastStartSelected")
                 request.append(try DERPHandshake.clientInfo(privateKey: privateKey, serverKey: fastStartKey))
             }
+            let asked = ProcessInfo.processInfo.systemUptime
             try await connection.send(request)
             startupTrace?.record("httpUpgradeWritten")
             if attemptedFastStart { startupTrace?.record("clientInfoWritten") }
@@ -536,6 +564,7 @@ public actor DERPTransport {
             }
             let greeting = try await readFrame(connection)
             guard greeting.type == 1 else { throw TransportError.malformedPacket }
+            sampleRTT(ProcessInfo.processInfo.systemUptime - asked)
             let serverKey = try DERPHandshake.serverKey(greeting: greeting.payload, expected: fastStartKey)
             startupTrace?.record("httpUpgradeAndGreetingReceived")
             if !attemptedFastStart {
@@ -557,6 +586,7 @@ public actor DERPTransport {
             try await connection.send(DERPFrame.encode(type: 7, payload: Data([1])))
             reader = Task { await receiveLoop(connection, id: id) }
             watchdog = Task { await keepaliveLoop(connection, id: id) }
+            if recovering { recovering = false; recovered.yield() }
         } catch {
             connection.close()
             let canRetry = attemptedFastStart && generation == id && !closed && !Task.isCancelled
@@ -598,6 +628,7 @@ public actor DERPTransport {
                     try await connection.send(DERPFrame.encode(type: 0x13, payload: frame.payload))
                 case 0x13:
                     guard frame.payload.count == 8 else { throw TransportError.malformedPacket }
+                    if let sent = pings.removeValue(forKey: frame.payload) { sampleRTT(ProcessInfo.processInfo.systemUptime - sent) }
                 case 8:
                     guard frame.payload.count >= 32 else { throw TransportError.malformedPacket }
                 case 0x15:
@@ -626,13 +657,19 @@ public actor DERPTransport {
                 }
                 let silent = Date().timeIntervalSince(lastReceived)
                 guard silent < 120 else { throw TransportError.timeout }
-                if silent >= 70 { try await connection.send(DERPFrame.encode(type: 0x12, payload: NaClBox.random(8))) }
+                if silent >= 70 {
+                    let ping = NaClBox.random(8)
+                    pinged(ping)
+                    try await connection.send(DERPFrame.encode(type: 0x12, payload: ping))
+                }
             }
         } catch { if !Task.isCancelled { failed(id: id) } }
     }
 
     private func failed(id: UUID, reconnectDelay: Double = 0.25) {
         guard generation == id, !closed else { return }
+        recovering = true
+        pings.removeAll()
         generation = UUID(); stream?.close(); stream = nil; incoming = Data()
         reader?.cancel(); watchdog?.cancel()
         for waiter in rateWaiters.values { waiter.cancel() }

@@ -293,6 +293,8 @@ public actor NetworkTransport {
     private let discoPrivateKey: Data
     private let discoKeys = DiscoveryKeyCache()
     private let relay: DERPTransport
+    /// The relay connection up again after a failure (`DERPTransport.recoveries`).
+    nonisolated var relayRecoveries: AsyncStream<Void> { relay.recoveries }
     private let relayNodes: [DERPNode]
     private let relayFirst: Bool
     private let discovery: DirectDiscovery

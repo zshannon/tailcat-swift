@@ -555,6 +555,19 @@ internal actor IPStack {
         return nil
     }
 
+    /// The way to the peers was just replaced (a relay connection found
+    /// dead): what each flow sent into the old one was lost, and would wait
+    /// out a timer that backed off while there was no way. Each flow still
+    /// owed an acknowledgement sends its first unacknowledged segment again
+    /// now, its timer back at the start.
+    func resendOwed() {
+        for state in Array(connections.values) + Array(closing.values) where !state.segments.isEmpty && state.finishedAt == nil {
+            state.retransmitDelay = 0.5
+            resend(state)
+            schedule(state)
+        }
+    }
+
     private func acknowledge(_ state: TCPState, _ ack: UInt32) {
         guard !Self.before(ack, state.sendUnacknowledged), !Self.before(state.sendNext, ack) else { return }
         let advanced = Int(ack &- state.sendUnacknowledged)

@@ -702,9 +702,59 @@ final class RelayFirstTests: XCTestCase {
             try await eventually { fixture.authenticatedConnections > connections }
             let elapsed = Date().timeIntervalSince(woke)
             print("SILENT-RELAY-RECOVERY \(Int(elapsed * 1000))ms")
-            XCTAssertGreaterThanOrEqual(elapsed, 1.9); XCTAssertLessThan(elapsed, 3.5)
+            // Three of its round trips, at least a second.
+            XCTAssertGreaterThanOrEqual(elapsed, 0.9); XCTAssertLessThan(elapsed, 2.5)
             try await exchange(pair.stream, pair.accepted, "same stream over the replaced relay")
             XCTAssertEqual(fixture.relayedInitiations, initiations, "The session is kept")
+            await gate.release(); await pair.client.close(); await pair.server.close()
+        } catch { await gate.release(); await pair.client.close(); await pair.server.close(); throw error }
+    }
+
+    /// A move nobody was told of: what a flow wrote into the dead relay
+    /// connection goes again as soon as a check has it replaced, not when
+    /// its timer, backed off meanwhile, next comes round.
+    func testAReplacedRelayGetsWhatItsFlowsOweAtOnce() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        let gate = DiscoveryGate() // No UDP: the relay is the only way.
+        let pair = try await wakePair(fixture, port: 8094, client: gatedDiscovery(gate))
+        do {
+            try await exchange(pair.stream, pair.accepted, "relay before the move")
+            let connections = fixture.authenticatedConnections
+            fixture.silence(await pair.client.publicKey.rawValue)
+            let stream = pair.stream
+            let write = Task { try await stream.write(Data("owed".utf8)) }
+            // Sent again at 0.5, 1.5 and 3.5 s into the dead connection; next at 7.5 s.
+            try await Task.sleep(nanoseconds: 4_000_000_000)
+            let woke = Date()
+            await pair.client.wake()
+            var received = Data()
+            while received.count < 4 { received.append(try await pair.accepted.read()) }
+            let elapsed = Date().timeIntervalSince(woke)
+            print("OWED-AFTER-RELAY-REPLACED \(Int(elapsed * 1000))ms")
+            XCTAssertEqual(received, Data("owed".utf8))
+            XCTAssertGreaterThan(fixture.authenticatedConnections, connections)
+            // The check's second, the reconnect and a round trip; not the 3.5 s to the timer.
+            XCTAssertLessThan(elapsed, 2.5)
+            try await write.value
+            try await exchange(pair.stream, pair.accepted, "same stream after")
+            await gate.release(); await pair.client.close(); await pair.server.close()
+        } catch { await gate.release(); await pair.client.close(); await pair.server.close(); throw error }
+    }
+
+    /// A slow relay that answers is kept: its check waits three of its
+    /// round trips, measured as it connected, not a flat second.
+    func testACheckKeepsALiveRelayWithASlowRoundTrip() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        fixture.latency = 1.2
+        let gate = DiscoveryGate()
+        let pair = try await wakePair(fixture, port: 8095, client: gatedDiscovery(gate))
+        do {
+            try await exchange(pair.stream, pair.accepted, "slow relay before the check")
+            let connections = fixture.authenticatedConnections
+            await pair.client.wake()
+            try await Task.sleep(nanoseconds: 4_500_000_000)
+            XCTAssertEqual(fixture.authenticatedConnections, connections, "a relay that answers in 1.2 s was replaced")
+            try await exchange(pair.stream, pair.accepted, "same relay after the check")
             await gate.release(); await pair.client.close(); await pair.server.close()
         } catch { await gate.release(); await pair.client.close(); await pair.server.close(); throw error }
     }

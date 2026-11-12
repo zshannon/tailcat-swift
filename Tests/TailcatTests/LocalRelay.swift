@@ -60,6 +60,7 @@ final class LocalRelay: @unchecked Sendable {
     private let fastStartBehavior: FastStartBehavior
     private var fastStarts = 0
     private var silent = Set<ObjectIdentifier>()
+    private var delay: TimeInterval = 0
     private var authenticated = 0
     private var initiations = 0
     private var initiationsToDrop = 0
@@ -67,6 +68,12 @@ final class LocalRelay: @unchecked Sendable {
     private var clientNonces = [Data]()
 
     var serverPublicKey: Data { get throws { try NaClBox.publicKey(for: privateKey) } }
+    /// How long the relay takes to answer a connection's upgrade and each
+    /// ping, as a slow link would; relayed packets are not held.
+    var latency: TimeInterval {
+        get { lock.lock(); defer { lock.unlock() }; return delay }
+        set { lock.lock(); delay = newValue; lock.unlock() }
+    }
     var fastStartCount: Int { lock.lock(); defer { lock.unlock() }; return fastStarts }
     var authenticationNonces: [Data] { lock.lock(); defer { lock.unlock() }; return clientNonces }
     /// Relay connections that got through authentication.
@@ -132,6 +139,7 @@ final class LocalRelay: @unchecked Sendable {
                 header.append(try connection.read(1))
             }
             let fast = String(decoding: header, as: UTF8.self).contains("Derp-Fast-Start: 1\r\n")
+            if latency > 0 { Thread.sleep(forTimeInterval: latency) }
             if fast { lock.lock(); fastStarts += 1; lock.unlock() }
             if fast, fastStartBehavior == .stalled {
                 while true { _ = try connection.read(1) }
@@ -175,7 +183,10 @@ final class LocalRelay: @unchecked Sendable {
                     lock.unlock()
                     try? target?.send(DERPFrame.encode(type: 5, payload: key + frame.payload.dropFirst(32)))
                 } else if frame.type == 0x12 {
-                    try connection.send(DERPFrame.encode(type: 0x13, payload: frame.payload))
+                    let pong = try DERPFrame.encode(type: 0x13, payload: frame.payload)
+                    let latency = self.latency
+                    if latency > 0 { DispatchQueue.global().asyncAfter(deadline: .now() + latency) { try? connection.send(pong) } }
+                    else { try connection.send(pong) }
                 }
             }
         } catch {}
