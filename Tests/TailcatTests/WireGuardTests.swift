@@ -165,4 +165,22 @@ final class WireGuardTests: XCTestCase {
         XCTAssertTrue(window.accept(1_000_000)); XCTAssertFalse(window.accept(16384))
         XCTAssertFalse(window.accept(UInt64.max-8192)); XCTAssertFalse(window.accept(UInt64.max))
     }
+
+    func testASecondAnswerToTheSameInitiationReplacesTheSessionTheResponderDropped() throws {
+        // A responder that took two copies of one initiation at once answers twice and keeps the later keypair.
+        var (a,b) = try peers(); let twin = b
+        let initiation = try a.initiate(now: now)
+        let first = try XCTUnwrap(b.receive(initiation, now: now).response)
+        var kept = twin; let second = try XCTUnwrap(kept.receive(initiation, now: now).response)
+        XCTAssertTrue(try a.receive(first, now: now).handshakeCompleted)
+        let adopted = try a.receive(second, now: now)
+        XCTAssertTrue(adopted.handshakeCompleted)
+        XCTAssertTrue(try kept.receive(XCTUnwrap(adopted.response), now: now).handshakeCompleted)
+        XCTAssertEqual(try kept.receive(a.encrypt(ipPacket(1), now: now), now: now).plaintext, ipPacket(1))
+        XCTAssertThrowsError(try a.receive(first, now: now)) { XCTAssertEqual($0 as? WireGuard.Error, .unexpectedMessage) }
+        // Once the responder has used the session, no later answer replaces it.
+        var third = twin; let late = try XCTUnwrap(third.receive(initiation, now: now).response)
+        XCTAssertEqual(try a.receive(kept.encrypt(ipPacket(2), now: now), now: now).plaintext, ipPacket(2))
+        XCTAssertThrowsError(try a.receive(late, now: now)) { XCTAssertEqual($0 as? WireGuard.Error, .unexpectedMessage) }
+    }
 }
