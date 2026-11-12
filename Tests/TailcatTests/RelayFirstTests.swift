@@ -648,12 +648,13 @@ final class RelayFirstTests: XCTestCase {
         }
     }
 
-    private func wakePair(_ fixture: LocalRelay, port: UInt16, client clientDiscovery: DirectDiscovery? = nil) async throws
+    private func wakePair(_ fixture: LocalRelay, port: UInt16, client clientDiscovery: DirectDiscovery? = nil,
+                          server serverDiscovery: DirectDiscovery? = nil) async throws
         -> (server: TailcatServer, client: TailcatClient, stream: TailcatConnection, accepted: TailcatConnection) {
         var serverConfig = TailcatServer.Configuration()
         serverConfig.relayFirst = true
         serverConfig.region = DERPRegion(regionID: 1, nodes: [fixture.node])
-        serverConfig.directDiscovery = loopbackDiscovery()
+        serverConfig.directDiscovery = serverDiscovery ?? loopbackDiscovery()
         let server = TailcatServer(configuration: serverConfig)
         let listener = try await server.listen(port: port)
         var config = TailcatClient.Configuration()
@@ -778,6 +779,49 @@ final class RelayFirstTests: XCTestCase {
             guard case .direct = during else { XCTFail("Dropped before its deadline"); throw TransportError.closed }
             try await eventually { await pair.client.path == .relay }
             try await exchange(pair.stream, pair.accepted, "same stream over the relay")
+            await pair.client.close(); await pair.server.close()
+        } catch { await pair.client.close(); await pair.server.close(); throw error }
+    }
+
+    func testDataRacingTheWakeProbeOfAnExpiredRouteStillGoesDirect() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        let filter = DiscoveryPacketFilter()
+        var discovery = loopbackDiscovery()
+        discovery.open = { receive in try UDPChannel { packet, endpoint in if !filter.drops(packet) { receive(packet, endpoint) } } }
+        // Over loopback the relay is as fast as UDP: keep the relay reset marker
+        // from landing at the server while it is answering the new Ping.
+        var serverDiscovery = loopbackDiscovery()
+        serverDiscovery.open = { receive in
+            try UDPChannel { packet, endpoint in
+                guard Discovery.isPacket(packet) else { return receive(packet, endpoint) }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.02) { receive(packet, endpoint) }
+            }
+        }
+        let pair = try await wakePair(fixture, port: 8095, client: discovery, server: serverDiscovery)
+        do {
+            try await eventually {
+                if case .direct = await pair.client.path,
+                   case .direct = try? await pair.server.path(to: pair.client.publicKey) { return true }
+                return false
+            }
+            // Startup discovery ends first, so the wake sends a probe of its own.
+            try await Task.sleep(nanoseconds: 1_500_000_000)
+            // Back after a minute: the route's last Pong is past its lifetime. The
+            // wake's Pongs are still on their way when the first data goes out.
+            await pair.client.ageDirectForTesting(by: 31)
+            filter.setBlocked(true)
+            await pair.client.wake()
+            try await Task.sleep(nanoseconds: 150_000_000)
+            filter.setBlocked(false)
+            try await exchange(pair.stream, pair.accepted, "first data after waking")
+            let sent = Date()
+            try await within(0.5) {
+                while true {
+                    if case .direct = await pair.client.path { return }
+                    try await Task.sleep(nanoseconds: 10_000_000)
+                }
+            }
+            print("EXPIRED-ROUTE-DIRECT-AGAIN \(Int(Date().timeIntervalSince(sent) * 1000))ms")
             await pair.client.close(); await pair.server.close()
         } catch { await pair.client.close(); await pair.server.close(); throw error }
     }

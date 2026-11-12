@@ -610,6 +610,16 @@ public actor NetworkTransport {
         scheduleProbe(nodeKey, force: true); scheduleInvitation(nodeKey)
     }
 
+    #if DEBUG
+    /// As if suspended for `seconds`: direct routes, probes and activity are that much older.
+    func ageDirectForTesting(by seconds: TimeInterval) {
+        for key in Array(peers.keys) {
+            peers[key]?.verified -= seconds; peers[key]?.lastProbe -= seconds
+            peers[key]?.lastCall -= seconds; peers[key]?.lastInvitation -= seconds; peers[key]?.lastActivity -= seconds
+        }
+    }
+    #endif
+
     /// Invalidates a failed path immediately; discovery can establish a fresh path later.
     func invalidateDirectPath(to nodeKey: Data) {
         peers[nodeKey]?.direct = nil
@@ -828,6 +838,9 @@ public actor NetworkTransport {
         if let peer = peers[nodeKey], peer.direct != nil, Date().timeIntervalSince(peer.verified) >= Self.directLifetime {
             invalidateDirectPath(to: nodeKey)
             requestRelayMarker(to: nodeKey)
+            // The probes it cancelled were what would renew the route: one goes again now.
+            peers[nodeKey]?.lastProbe = .distantPast
+            scheduleProbe(nodeKey, force: true)
         }
         try await sendPendingRelayMarker(to: nodeKey)
         TransportDiagnostics.log("send relay udp=\(udp?.port ?? 0) bytes=\(packet.count) type=\(WireGuard.packetType(packet) ?? 0)")
