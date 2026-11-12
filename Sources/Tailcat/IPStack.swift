@@ -57,7 +57,7 @@ internal actor IPStack {
         var windowAck: UInt32 = 0
         var mss = 1220
         var congestionWindow = 4880
-        var slowStartThreshold = 65_535
+        var slowStartThreshold = IPStack.sendWindowLimit
         var duplicateACKs = 0
         var retransmitDelay: TimeInterval = 0.5
         var segments: [Segment] = []
@@ -77,6 +77,12 @@ internal actor IPStack {
         var finishedAt: TimeInterval?
         /// The right edge of the window last advertised: the peer may send up to it.
         var advertisedEdge: UInt32 = 0
+        /// RFC 7323 shifts for the windows the peer advertises and for ours. Both
+        /// stay zero unless the SYN and the SYN-ACK each carried the option.
+        var sendScale: UInt8 = 0
+        var receiveScale: UInt8 = 0
+        /// Whether our SYN or SYN-ACK carries the window scale option.
+        var offersScale = true
 
         init(key: FlowKey, phase: Phase, sequence: UInt32, listener: UUID? = nil) {
             self.key = key
@@ -136,11 +142,24 @@ internal actor IPStack {
     internal private(set) var wakeups = 0
     private var output: [Data] = []
     private var outputRunning = false
-    private let receiveCapacity = 65_535
+    /// Bytes a flow buffers for the application, unread or out of order. At
+    /// 1 MiB a relayed path with a 135 ms RTT can carry about 7 MB/s; memory is
+    /// only held while the application falls behind its reads.
+    private let receiveCapacity: Int
+    /// The window scale shift that lets the 16-bit window field state the capacity.
+    private let windowShift: UInt8
+    /// Bounds a flow's congestion window: at 215 full segments, four flows in
+    /// flight still fit the 1024-packet output queue.
+    private static let sendWindowLimit = 262_144
 
-    internal init(address: Data, send: @escaping @Sendable (Data) async throws -> Void) {
+    internal init(address: Data, receiveCapacity: Int = 1 << 20,
+                  send: @escaping @Sendable (Data) async throws -> Void) {
         self.address = address
         self.sendPacket = send
+        self.receiveCapacity = receiveCapacity
+        var shift: UInt8 = 0
+        while receiveCapacity >> shift > 65_535 && shift < 14 { shift += 1 }
+        self.windowShift = shift
     }
 
     deinit { timer?.cancel() }
@@ -371,6 +390,10 @@ internal actor IPStack {
                 state.windowSequence = sequence
                 state.remoteWindow = UInt32(Self.u16(body, 14))
                 state.mss = parseMSS(body, headerLength: headerLength)
+                if let shift = parseWindowScale(body, headerLength: headerLength) {
+                    state.sendScale = shift
+                    state.receiveScale = windowShift
+                } else { state.offersScale = false }
                 connections[state.id] = state
                 flows[key] = state.id
                 transmit(state, flags: 0x12)
@@ -391,6 +414,10 @@ internal actor IPStack {
             state.windowSequence = sequence
             state.windowAck = acknowledgement
             state.mss = parseMSS(body, headerLength: headerLength)
+            if let shift = parseWindowScale(body, headerLength: headerLength) {
+                state.sendScale = shift
+                state.receiveScale = windowShift
+            }
             state.phase = .established
             acknowledge(state, acknowledgement)
             sendACK(state)
@@ -437,7 +464,7 @@ internal actor IPStack {
         let oldWindow = state.remoteWindow
         if Self.before(state.windowSequence, sequence) ||
             (state.windowSequence == sequence && !Self.before(acknowledgement, state.windowAck)) {
-            state.remoteWindow = UInt32(Self.u16(body, 14))
+            state.remoteWindow = UInt32(Self.u16(body, 14)) << state.sendScale
             state.windowSequence = sequence
             state.windowAck = acknowledgement
         }
@@ -465,7 +492,7 @@ internal actor IPStack {
     /// or by a segment once the peer has less than two left to send (RFC 1122
     /// 4.2.3.3). Each read used to send its own update.
     private func windowUpdateDue(_ state: TCPState) -> Bool {
-        let window = UInt32(receiveWindow(state))
+        let window = advertisableWindow(state)
         let promised = Self.before(state.advertisedEdge, state.receiveNext) ? 0 : state.advertisedEdge &- state.receiveNext
         guard window > promised else { return false }
         let opened = window - promised
@@ -500,8 +527,18 @@ internal actor IPStack {
     }
 
     private func parseMSS(_ body: [UInt8], headerLength: Int) -> Int {
+        guard let offset = Self.option(2, length: 4, body, headerLength: headerLength) else { return 1220 }
+        return min(1220, max(1, Int(Self.u16(body, offset + 2))))
+    }
+
+    /// The shift a SYN's window scale option offers, capped at 14 (RFC 7323 2.3).
+    private func parseWindowScale(_ body: [UInt8], headerLength: Int) -> UInt8? {
+        guard let offset = Self.option(3, length: 3, body, headerLength: headerLength) else { return nil }
+        return min(14, body[offset + 2])
+    }
+
+    private static func option(_ wanted: UInt8, length wantedLength: Int, _ body: [UInt8], headerLength: Int) -> Int? {
         var offset = 20
-        var result = 1220
         while offset < headerLength {
             let kind = body[offset]
             if kind == 0 { break }
@@ -509,10 +546,10 @@ internal actor IPStack {
             guard offset + 1 < headerLength else { break }
             let length = Int(body[offset + 1])
             guard length >= 2, offset + length <= headerLength else { break }
-            if kind == 2 && length == 4 { result = min(1220, max(1, Int(Self.u16(body, offset + 2)))) }
+            if kind == wanted && length == wantedLength { return offset }
             offset += length
         }
-        return result
+        return nil
     }
 
     private func acknowledge(_ state: TCPState, _ ack: UInt32) {
@@ -532,7 +569,7 @@ internal actor IPStack {
         if advanced > 0 {
             let increment = state.congestionWindow < state.slowStartThreshold ? min(advanced, state.mss) :
                 max(1, state.mss * min(advanced, state.mss) / max(1, state.congestionWindow))
-            state.congestionWindow = min(65_535, state.congestionWindow + increment)
+            state.congestionWindow = min(Self.sendWindowLimit, state.congestionWindow + increment)
         }
         while let first = state.writes.first, let end = first.end, !Self.before(ack, end) {
             state.writes.removeFirst().continuation.resume()
@@ -550,9 +587,16 @@ internal actor IPStack {
         }
     }
 
-    private func receiveWindow(_ state: TCPState) -> UInt16 {
+    private func receiveWindow(_ state: TCPState) -> Int {
         let used = state.buffer.count + state.incoming.reduce(0) { $0 + $1.payload.count }
-        return UInt16(max(0, receiveCapacity - used))
+        return max(0, receiveCapacity - used)
+    }
+
+    /// The receive window as a segment can state it: scaled down, rounded down to
+    /// the scale's granularity, and never scaled in a SYN (RFC 7323 2.2).
+    private func advertisableWindow(_ state: TCPState, syn: Bool = false) -> UInt32 {
+        let shift = syn ? 0 : state.receiveScale
+        return UInt32(min(65_535, receiveWindow(state) >> shift)) << shift
     }
 
     private func ingest(_ state: TCPState, sequence: UInt32, payload: Data, fin: Bool) {
@@ -566,7 +610,7 @@ internal actor IPStack {
             seq = state.receiveNext
         }
         let distance = Int(seq &- state.receiveNext)
-        let capacity = Int(receiveWindow(state))
+        let capacity = receiveWindow(state)
         guard distance <= capacity else { return }
         let accepted = min(data.count, max(0, capacity - distance))
         let acceptedFIN = fin && accepted == data.count && distance + accepted < capacity
@@ -576,7 +620,8 @@ internal actor IPStack {
             state.receiveNext &+= UInt32(data.count)
             if acceptedFIN { state.readEOF = true; state.receiveNext &+= 1 }
         } else if !data.isEmpty || acceptedFIN {
-            if !state.incoming.contains(where: { $0.sequence == seq && $0.payload.count >= data.count }) && state.incoming.count < 256 {
+            // Enough segments for a whole window lost behind one hole.
+            if !state.incoming.contains(where: { $0.sequence == seq && $0.payload.count >= data.count }) && state.incoming.count < 1024 {
                 state.incoming.append(Incoming(sequence: seq, payload: data, fin: acceptedFIN))
             }
         }
@@ -617,22 +662,22 @@ internal actor IPStack {
     }
 
     private func retransmit(_ state: TCPState, _ segment: Segment) {
-        let window = receiveWindow(state)
+        let syn = segment.flags & 0x02 != 0
         emit(tcpPacket(state.key, sequence: segment.sequence, ack: state.receiveNext,
-                       flags: segment.flags, window: window, payload: segment.payload))
-        acknowledged(state, window: window)
+                       flags: segment.flags, window: advertise(state, syn: syn), payload: segment.payload,
+                       windowScale: syn && state.offersScale ? windowShift : nil))
     }
 
     private func sendACK(_ state: TCPState) {
-        let window = receiveWindow(state)
         emit(tcpPacket(state.key, sequence: state.sendNext, ack: state.receiveNext,
-                       flags: 0x10, window: window))
-        acknowledged(state, window: window)
+                       flags: 0x10, window: advertise(state)))
     }
 
-    /// A segment just carried RCV.NXT and this window.
-    private func acknowledged(_ state: TCPState, window: UInt16) {
-        state.advertisedEdge = state.receiveNext &+ UInt32(window)
+    /// The window field for a segment carrying RCV.NXT, recording the edge it promises.
+    private func advertise(_ state: TCPState, syn: Bool = false) -> UInt16 {
+        let window = advertisableWindow(state, syn: syn)
+        state.advertisedEdge = state.receiveNext &+ window
+        return UInt16(window >> (syn ? 0 : state.receiveScale))
     }
 
     private func flush(_ state: TCPState) {
@@ -643,7 +688,11 @@ internal actor IPStack {
                 let allowed = min(Int(state.remoteWindow), state.congestionWindow) - inFlight
                 guard allowed > 0 else { return }
                 let offset = state.writes[index].offset
-                let count = min(state.mss, allowed, state.writes[index].data.count - offset)
+                let remaining = state.writes[index].data.count - offset
+                let count = min(state.mss, allowed, remaining)
+                // RFC 1122 4.2.3.4: while an ACK is due, wait for a full segment's window
+                // rather than split segments as the window opens bytes at a time.
+                if count < min(state.mss, remaining) && inFlight > 0 { return }
                 let bytes = state.writes[index].data.subdata(in: offset..<(offset + count))
                 state.writes[index].offset += count
                 transmit(state, flags: 0x18, payload: bytes)
@@ -898,7 +947,7 @@ internal actor IPStack {
                 // A sequence one byte before SND.NXT elicits the current window
                 // without advancing the stream or consuming unsent application data.
                 emit(tcpPacket(state.key, sequence: state.sendNext &- 1, ack: state.receiveNext,
-                               flags: 0x10, window: receiveWindow(state)))
+                               flags: 0x10, window: advertise(state)))
                 if now - state.lastActivity > 120 { fail(state.id, error: TailcatTransportError.timedOut) }
             }
         }
@@ -913,8 +962,8 @@ internal actor IPStack {
     }
 
     private func tcpPacket(_ key: FlowKey, sequence: UInt32, ack: UInt32, flags: UInt8,
-                           window: UInt16, payload: Data = Data()) -> Data {
-        var body = [UInt8](repeating: 0, count: flags & 0x02 != 0 ? 24 : 20)
+                           window: UInt16, payload: Data = Data(), windowScale: UInt8? = nil) -> Data {
+        var body = [UInt8](repeating: 0, count: flags & 0x02 != 0 ? (windowScale == nil ? 24 : 28) : 20)
         Self.put16(&body, 0, key.localPort)
         Self.put16(&body, 2, key.remotePort)
         Self.put32(&body, 4, sequence)
@@ -923,6 +972,7 @@ internal actor IPStack {
         body[13] = flags
         Self.put16(&body, 14, window)
         if flags & 0x02 != 0 { body[20] = 2; body[21] = 4; Self.put16(&body, 22, 1220) }
+        if let windowScale { body[24] = 1; body[25] = 3; body[26] = 3; body[27] = windowScale }
         body.append(contentsOf: payload)
         Self.put16(&body, 16, Self.checksum(source: address, destination: key.peer, proto: 6, body: body))
         return ipv6(peer: key.peer, proto: 6, body: body)
