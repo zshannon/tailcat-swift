@@ -142,5 +142,27 @@ final class DERPHandshakeTests: XCTestCase {
         XCTAssertEqual(received?.payload, Data("first relay remains independent".utf8))
         await second.close(); await first.close()
     }
+
+    func testBackToBackSendsArePacedAfterABurst() async throws {
+        let fixture = try LocalRelay()
+        defer { fixture.close() }
+        let senderKey = NaClBox.random(32), receiverKey = NaClBox.random(32)
+        let sender = DERPTransport(node: fixture.node, privateKey: senderKey)
+        let receiver = DERPTransport(node: fixture.node, privateKey: receiverKey)
+        try await receiver.connect(); try await sender.connect()
+        let destination = try NaClBox.publicKey(for: receiverKey)
+        // 100 frames of 1,317 bytes leave at 100 Mbit/s after the 5,600-byte burst.
+        let start = ProcessInfo.processInfo.systemUptime
+        for index in 0..<100 {
+            try await sender.send(to: destination, packet: Data(repeating: UInt8(index), count: 1280))
+        }
+        XCTAssertGreaterThanOrEqual(ProcessInfo.processInfo.systemUptime - start, Double(100 * 1317 - 5600) / 12_500_000)
+        var packets = receiver.packets.makeAsyncIterator()
+        for index in 0..<100 {
+            let packet = try await packets.next()
+            XCTAssertEqual(packet?.payload.first, UInt8(index))
+        }
+        await sender.close(); await receiver.close()
+    }
     #endif
 }

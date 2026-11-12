@@ -269,6 +269,8 @@ public actor DERPTransport {
     private var tokenRate: Double = 0
     private var tokenBurst: Double = 0
     private var tokenDate = ProcessInfo.processInfo.systemUptime
+    private var paceTokens = 0.0
+    private var paceDate = ProcessInfo.processInfo.systemUptime
     private var pendingSends = 0
     private var rateWaiters = [UUID: Task<Void, Error>]()
     private var stream: DERPStream?
@@ -346,6 +348,7 @@ public actor DERPTransport {
                 guard let stream else { throw TransportError.closed }
                 let id = generation
                 try await rateLimit(packet.count + 37)
+                try await pace(packet.count + 37)
                 guard generation == id, !closed else { throw TransportError.closed }
                 do {
                     TransportDiagnostics.log("DERP write begin generation=\(id) bytes=\(packet.count)")
@@ -406,6 +409,18 @@ public actor DERPTransport {
         TransportDiagnostics.log("DERP reset generation=\(generation)")
         connecting?.task.cancel()
         failed(id: generation, reconnectDelay: 0)
+    }
+
+    /// Spaces bursts to 100 Mbit/s after four full packets. The relay queues 32
+    /// packets per destination and drops the oldest past that, so a TCP flight
+    /// written all at once loses its head; without SACK, each loss costs an RTT.
+    private func pace(_ size: Int) async throws {
+        let rate = 12_500_000.0, burst = 5600.0
+        let now = ProcessInfo.processInfo.systemUptime
+        paceTokens = min(burst, paceTokens + max(0, now - paceDate) * rate)
+        paceDate = now
+        paceTokens -= Double(size)
+        if paceTokens < 0 { try await Task.sleep(nanoseconds: UInt64(-paceTokens / rate * 1_000_000_000)) }
     }
 
     private func rateLimit(_ size: Int) async throws {
