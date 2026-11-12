@@ -84,7 +84,10 @@ public final class TailcatConnection: Sendable {
         await stack.closeConnection(id)
     }
 
-    internal func abort() async {
+    /// Resets the stream: the peer's reads and writes fail at once and it
+    /// sends no more. For a response no longer wanted, which `close` would
+    /// take in whole and discard.
+    public func abort() async {
         await stack.abortConnection(id)
     }
 }

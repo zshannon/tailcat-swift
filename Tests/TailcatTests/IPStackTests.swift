@@ -29,6 +29,8 @@ private actor PacketLink {
     private(set) var drops = 0
     private(set) var deliveredResets = 0
     private(set) var deliveredACKs = 0
+    /// Data segments delivered from b to a.
+    private(set) var deliveredDataToA = 0
     private var lastClientFIN: Data?
 
     init(faults: Faults = Faults()) { self.faults = faults }
@@ -109,6 +111,7 @@ private actor PacketLink {
         await target.receive(data)
         if data.count >= 60 && data[6] == 6 && data[53] & 0x04 != 0 { deliveredResets += 1 }
         if data.count >= 60 && data[6] == 6 && data[53] == 0x10 { deliveredACKs += 1 }
+        if !fromA && data.count > 60 && data[6] == 6 && data.count - 40 - Int(data[52] >> 4) * 4 > 0 { deliveredDataToA += 1 }
     }
 }
 
@@ -849,6 +852,37 @@ final class IPStackTests: XCTestCase {
             XCTAssertEqual(received, payload)
             try await writer.value
             try await response.value
+            do { _ = try await client.read(); XCTFail("Expected local close") }
+            catch { XCTAssertEqual(error as? TailcatTransportError, .closed) }
+        }
+        await a.close(); await b.close()
+    }
+
+    func testAbortResetsThePeerAndStopsItsData() async throws {
+        let (a, b, link) = await pair(receiveCapacity: 65_535)
+        let listener = try await b.listen(port: 84)
+        let peer = addressB
+        try await deadline {
+            let client = try await a.connect(peer: peer, port: 84)
+            let server = try await listener.accept()
+            // A response far past the window: still being written when the reader lets go.
+            let response = Task { try await server.write(Data(repeating: 0x19, count: 2_000_000)) }
+            let first = try await client.read()
+            XCTAssertFalse(first.isEmpty)
+            await client.abort()
+            do { try await response.value; XCTFail("Expected the peer's write to fail") }
+            catch { XCTAssertEqual(error as? TailcatTransportError, .connectionReset) }
+            do { _ = try await server.read(); XCTFail("Expected a reset") }
+            catch { XCTAssertEqual(error as? TailcatTransportError, .connectionReset) }
+            let resets = await link.deliveredResets
+            XCTAssertGreaterThanOrEqual(resets, 1)
+            // What was on the link when the reset landed arrives; then nothing more.
+            try await Task.sleep(nanoseconds: 100_000_000)
+            let sent = await link.deliveredDataToA
+            try await Task.sleep(nanoseconds: 300_000_000)
+            let after = await link.deliveredDataToA
+            XCTAssertEqual(after, sent, "the peer sent more after the reset")
+            XCTAssertLessThan(sent, 100, "most of the response was sent anyway")
             do { _ = try await client.read(); XCTFail("Expected local close") }
             catch { XCTAssertEqual(error as? TailcatTransportError, .closed) }
         }
