@@ -73,8 +73,12 @@ private final class DERPStream: @unchecked Sendable {
         }
         let host = !node.ipv4.isEmpty && node.ipv4 != "none" ? node.ipv4 :
             (!node.ipv6.isEmpty && node.ipv6 != "none" ? node.ipv6 : node.hostName)
+        // DERP frames are small and latency-bound; Nagle plus delayed ACK holds
+        // them back by a round trip.
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
         connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort,
-                                  using: NWParameters(tls: tls, tcp: NWProtocolTCP.Options()))
+                                  using: NWParameters(tls: tls, tcp: tcp))
     }
 
     func start() async throws {
@@ -189,6 +193,8 @@ private final class DERPStream: @unchecked Sendable {
             writeQueue.async { [self] in
                 var timeout = timeval(tv_sec: 15, tv_usec: 0)
                 _ = setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+                var noDelay: Int32 = 1
+                _ = setsockopt(descriptor, Int32(IPPROTO_TCP), TCP_NODELAY, &noDelay, socklen_t(MemoryLayout<Int32>.size))
                 let flags = fcntl(descriptor, F_GETFL)
                 guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
                     continuation.resume(throwing: TransportError.connectionFailed("TCP configure: \(errno)")); return
