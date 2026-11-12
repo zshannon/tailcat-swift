@@ -203,6 +203,7 @@ public actor TailcatClient {
     public func resetNetworkPaths() async { await engine.resetNetwork() }
     #if DEBUG
     func ageForTesting(by seconds: TimeInterval) async { await engine.ageForTesting(by: seconds) }
+    func ageDirectForTesting(by seconds: TimeInterval) async { await engine.ageDirectForTesting(by: seconds) }
     #endif
     /// This client's TCP flows to the server, open and closing, against
     /// the budgets in `TailcatFlowStatistics`.
@@ -403,6 +404,7 @@ internal actor TailcatEngine {
             peers[node] = peer
         }
     }
+    func ageDirectForTesting(by seconds: TimeInterval) async { await network.ageDirectForTesting(by: seconds) }
     #endif
     func flowStatistics() async -> TailcatFlowStatistics {
         guard let stack else { return TailcatFlowStatistics(open: 0, closing: 0) }
