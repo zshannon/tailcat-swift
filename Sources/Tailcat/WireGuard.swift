@@ -25,6 +25,9 @@ struct WireGuard: Sendable {
     private let presharedKey: Data
     private let staticShared: Data
     private var pending: Initiation?
+    /// The initiation `current` came from, until the peer has used it: a responder that
+    /// took two copies of it answers twice and keeps only the later keypair.
+    private var answered: (initiation: Initiation, responders: Set<UInt32>)?
     private var previous: Session?
     private var current: Session?
     private var next: Session?
@@ -138,6 +141,7 @@ struct WireGuard: Sendable {
         let packet = addMACs(body, now: now)
         lastSentTimestamp = timestamp
         pending = Initiation(chain: chain, hash: hash, ephemeral: ephemeral, localIndex: index, created: now)
+        answered = nil
         lastOutbound = Outbound(packet: packet, localIndex: index, created: now)
         return packet
     }
@@ -219,7 +223,13 @@ struct WireGuard: Sendable {
     }
 
     private mutating func consumeResponse(_ packet: Data, now: Date) throws -> ReceiveResult {
-        guard let initiation = pending, Self.u32(packet,8) == initiation.localIndex else { throw Error.unexpectedMessage }
+        let responder = Self.u32(packet,4)
+        let initiation: Initiation
+        if let candidate = pending, Self.u32(packet,8) == candidate.localIndex { initiation = candidate }
+        else if let candidate = answered, Self.u32(packet,8) == candidate.initiation.localIndex,
+                !candidate.responders.contains(responder), now.timeIntervalSince(candidate.initiation.created) < 5 {
+            initiation = candidate.initiation
+        } else { throw Error.unexpectedMessage }
         guard now.timeIntervalSince(initiation.created) < 180 else { throw Error.expired }
         let ephemeral = Data(packet[12..<44])
         var hash = Self.hash(initiation.hash, ephemeral)
@@ -230,8 +240,10 @@ struct WireGuard: Sendable {
         hash = Self.hash(hash, keys[1])
         _ = try TailcatCrypto.open(Data(packet[44..<60]), key: keys[2], nonce: Self.zeroNonce, authenticating: hash)
         let transportKeys = Self.kdf(keys[0], Data(), count: 2)
-        previous = current
-        current = Session(sendKey: transportKeys[0], receiveKey: transportKeys[1], localIndex: initiation.localIndex, remoteIndex: Self.u32(packet,4), created: now, initiator: true)
+        // A later answer replaces the session it shares an index with; the responder dropped that one.
+        if pending != nil { previous = current }
+        current = Session(sendKey: transportKeys[0], receiveKey: transportKeys[1], localIndex: initiation.localIndex, remoteIndex: responder, created: now, initiator: true)
+        answered = (initiation, (answered?.responders ?? []).union([responder]))
         pending = nil
         // The first transport authenticates the response for the responder and
         // promotes its next keypair even when there is no queued IP packet.
@@ -252,6 +264,7 @@ struct WireGuard: Sendable {
         guard replay.accept(counter) else { throw Error.replay }
         let padded = try TailcatCrypto.open(Data(packet.dropFirst(16)), key: session.receiveKey, nonce: Self.nonce(counter))
         session.replay = replay
+        if slot != 0 { answered = nil }
         if slot == 2 { previous=current; current=session; next=nil }
         else if slot == 1 { current=session }
         else { previous=session }

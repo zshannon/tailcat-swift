@@ -248,6 +248,9 @@ internal actor TailcatEngine {
         var earlyInitiation: Data?
         /// Woken with an expired session: rekey at the next tick, before anything is sent.
         var rekeyNow = false
+        /// When data first went on a session the server has yet to answer: the server may hold
+        /// another keypair for our initiation. `.distantPast` once a fresh one was sent for it.
+        var unansweredSince: Date?
         var lastSend = Date()
         var pending: [Data] = []
         var pendingBytes = 0
@@ -661,6 +664,7 @@ internal actor TailcatEngine {
         let encrypted = try peer.wireguard.encrypt(packet)
         peer.lastSend = Date()
         if !packet.isEmpty { peer.lastActivity = peer.lastSend }
+        if !packet.isEmpty, !peer.authenticated, peer.unansweredSince == nil { peer.unansweredSince = peer.lastSend }
         peers[node] = peer
         try await network.send(to: node, packet: encrypted)
     }
@@ -734,12 +738,18 @@ internal actor TailcatEngine {
             // than five: an initiation lost to a relay that died during a suspension would otherwise
             // hold that data for five seconds. An idle expired session waits for the next mark.
             let waiting = !peer.wireguard.isUsable(now: now) && (!peer.pending.isEmpty || peer.rekeyNow)
-            if (!peer.wireguard.isEstablished || waiting || (peer.wireguard.needsRekey(now: now) && due)),
-               now.timeIntervalSince(peer.lastHandshake) >= (waiting ? 1 : 5) {
+            // Unanswered for a second: a server that took two copies of our initiation may keep
+            // the keypair whose answer was lost. One fresh initiation, which it can take only once.
+            let unanswered = !server && !peer.authenticated && peer.wireguard.isEstablished
+                && peer.unansweredSince.map { $0 > .distantPast && now.timeIntervalSince($0) >= 1 } == true
+            if (!peer.wireguard.isEstablished || waiting || unanswered || (peer.wireguard.needsRekey(now: now) && due)),
+               now.timeIntervalSince(peer.lastHandshake) >= (waiting || unanswered ? 1 : 5) {
                 // Clients initiate the first handshake. Either endpoint may rekey established sessions.
                 if server && !peer.wireguard.isEstablished { continue }
                 let handshake = try peer.wireguard.initiateHandshake(now: now)
-                peer.lastHandshake = now; peer.rekeyNow = false; peers[node] = peer
+                peer.lastHandshake = now; peer.rekeyNow = false
+                if unanswered { peer.unansweredSince = .distantPast }
+                peers[node] = peer
                 startupTrace?.record("wireGuardInitiationSendStarted")
                 try await network.send(to: node, packet: handshake)
             } else if peer.wireguard.isUsable(now: now), due, now.timeIntervalSince(peer.lastSend) >= (idle ? Self.idleKeepalive : 25) { try await sendPayload(Data(), to: node) }
