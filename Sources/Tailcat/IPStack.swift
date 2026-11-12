@@ -688,7 +688,11 @@ internal actor IPStack {
                 let allowed = min(Int(state.remoteWindow), state.congestionWindow) - inFlight
                 guard allowed > 0 else { return }
                 let offset = state.writes[index].offset
-                let count = min(state.mss, allowed, state.writes[index].data.count - offset)
+                let remaining = state.writes[index].data.count - offset
+                let count = min(state.mss, allowed, remaining)
+                // RFC 1122 4.2.3.4: while an ACK is due, wait for a full segment's window
+                // rather than split segments as the window opens bytes at a time.
+                if count < min(state.mss, remaining) && inFlight > 0 { return }
                 let bytes = state.writes[index].data.subdata(in: offset..<(offset + count))
                 state.writes[index].offset += count
                 transmit(state, flags: 0x18, payload: bytes)

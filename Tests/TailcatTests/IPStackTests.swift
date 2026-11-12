@@ -544,11 +544,12 @@ final class IPStackTests: XCTestCase {
             XCTAssertEqual(synACK[53], 0x12)
             XCTAssertEqual(windowScale(synACK), peerShift == nil ? nil : 5)
             XCTAssertEqual(window(synACK), 65_535)
-            // Scaled by 2^7, the peer's ten opens 1,280 bytes; unscaled, 10.
+            // Scaled by 2^7, the peer's ten opens 1,280 bytes: one full segment, the
+            // rest held back until it is acknowledged. Unscaled, it opens 10.
             await a.receive(segment(sequence: 101, ack: sequenceNumber(synACK) &+ 1, flags: 0x10, window: 10))
             let server = try await deadline { try await listener.accept() }
             let writer = Task { try await server.write(Data(repeating: 1, count: 5000)) }
-            let allowed = peerShift == nil ? 10 : 1280
+            let allowed = peerShift == nil ? 10 : 1220
             try await waitForPayload(log, allowed)
             let before = await log.packets.count
             await a.receive(segment(sequence: 101, ack: sequenceNumber(synACK) &+ 1, flags: 0x18,
@@ -577,17 +578,17 @@ final class IPStackTests: XCTestCase {
             let scale: [UInt8] = peerShift.map { [1, 3, 3, $0] } ?? []
             // A SYN-ACK's own window is never scaled.
             await a.receive(segment(ports: (80, local), sequence: 500, ack: sequenceNumber(syn) &+ 1, flags: 0x12,
-                                    window: 2000, options: [2, 4, 0x04, 0xc4] + scale))
+                                    window: 2440, options: [2, 4, 0x04, 0xc4] + scale))
             let client = try await deadline { try await connect.value }
             let handshakeACK = try await sent(log, count: 2)[1]
             XCTAssertEqual(window(handshakeACK), peerShift == nil ? 65_535 : 32_768)
             let writer = Task { try await client.write(Data(repeating: 1, count: 10_000)) }
-            try await waitForPayload(log, 2000)
-            // The peer acknowledges both segments and opens 1,000 << shift.
-            await a.receive(segment(ports: (80, local), sequence: 501, ack: sequenceNumber(syn) &+ 2001,
-                                    flags: 0x10, window: 1000))
-            let opened = peerShift == nil ? 1000 : 4000
-            try await waitForPayload(log, 2000 + opened)
+            try await waitForPayload(log, 2440)
+            // The peer acknowledges both segments and opens 610 << shift.
+            await a.receive(segment(ports: (80, local), sequence: 501, ack: sequenceNumber(syn) &+ 2441,
+                                    flags: 0x10, window: 610))
+            let opened = peerShift == nil ? 610 : 2440
+            try await waitForPayload(log, 2440 + opened)
             await a.close()
             _ = try? await writer.value
         }
