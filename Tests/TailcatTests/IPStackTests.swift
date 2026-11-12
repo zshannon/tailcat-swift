@@ -594,6 +594,101 @@ final class IPStackTests: XCTestCase {
         }
     }
 
+    /// A connection from A to a hand-driven peer that scales its window by 2^7.
+    private func scriptedSender(_ log: PacketLog) async throws -> (IPStack, TailcatConnection, UInt16, UInt32) {
+        let a = IPStack(address: addressA) { await log.record($0) }
+        let peer = addressB
+        let connect = Task { try await a.connect(peer: peer, port: 80) }
+        let syn = try await sent(log, count: 1)[0]
+        let local = UInt16(syn[40]) << 8 | UInt16(syn[41])
+        await a.receive(segment(ports: (80, local), sequence: 500, ack: sequenceNumber(syn) &+ 1, flags: 0x12,
+                                window: 65_535, options: [2, 4, 0x04, 0xc4, 1, 3, 3, 7]))
+        let client = try await deadline { try await connect.value }
+        return (a, client, local, sequenceNumber(syn) &+ 1)
+    }
+
+    /// Data segments sent since packet `from`, as (sequence, length).
+    private func dataSegments(_ log: PacketLog, from: Int = 0) async -> [(UInt32, Int)] {
+        await log.packets.dropFirst(from).compactMap { packet in
+            let length = packet.count - 40 - Int(packet[52] >> 4) * 4
+            return length > 0 ? (sequenceNumber(packet), length) : nil
+        }
+    }
+
+    private func waitForSegments(_ log: PacketLog, from: Int, _ count: Int) async throws -> [(UInt32, Int)] {
+        for _ in 0..<300 {
+            let segments = await dataSegments(log, from: from)
+            if segments.count >= count { return segments }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("Expected \(count) data segments"); throw TailcatTransportError.timedOut
+    }
+
+    func testPartialACKRetransmitsTheNextHoleWithoutATimeout() async throws {
+        let log = PacketLog()
+        let (a, client, local, first) = try await scriptedSender(log)
+        let writer = Task { try await client.write(Data(repeating: 1, count: 4880)) }
+        let flight = try await waitForSegments(log, from: 0, 4)
+        XCTAssertEqual(flight.map(\.0), (0..<4).map { first &+ UInt32($0 * 1220) })
+        // The first two segments are lost: a window update and three duplicate
+        // ACKs, then the retransmitted first one is acknowledged only up to the second.
+        let before = await log.packets.count
+        let start = ProcessInfo.processInfo.systemUptime
+        for _ in 0..<4 {
+            await a.receive(segment(ports: (80, local), sequence: 501, ack: first, flags: 0x10, window: 65_535))
+        }
+        let fast = try await waitForSegments(log, from: before, 1)
+        XCTAssertEqual(fast.map(\.0), [first])
+        await a.receive(segment(ports: (80, local), sequence: 501, ack: first &+ 1220, flags: 0x10, window: 65_535))
+        let repaired = try await waitForSegments(log, from: before, 2)
+        XCTAssertEqual(repaired.map(\.0), [first, first &+ 1220])
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 0.4, "repaired before a retransmission timeout")
+        await a.receive(segment(ports: (80, local), sequence: 501, ack: first &+ 4880, flags: 0x10, window: 65_535))
+        try await deadline { try await writer.value }
+        await a.close()
+    }
+
+    func testRepeatedTimeoutsKeepHalfTheFlightAsSlowStartThreshold() async throws {
+        let log = PacketLog()
+        let (a, client, local, first) = try await scriptedSender(log)
+        let writer = Task { try await client.write(Data(repeating: 1, count: 400_000)) }
+        // Acknowledge each segment on its own until 32 are in flight.
+        var acked = first
+        var flight = try await waitForSegments(log, from: 0, 4)
+        while flight.count < 32 {
+            let before = await log.packets.count
+            for (sequence, length) in flight {
+                acked = sequence &+ UInt32(length)
+                await a.receive(segment(ports: (80, local), sequence: 501, ack: acked, flags: 0x10, window: 65_535))
+            }
+            flight = try await waitForSegments(log, from: before, 2 * flight.count)
+        }
+        XCTAssertEqual(flight.count, 32)
+        // Two timeouts in a row: the second must not take the threshold from
+        // the one-segment window the first left behind.
+        let before = await log.packets.count
+        let timeouts = try await waitForSegments(log, from: before, 2)
+        XCTAssertEqual(timeouts.map(\.0), [acked, acked])
+        let afterTimeouts = await log.packets.count
+        let end = flight.last.map { $0.0 &+ UInt32($0.1) }!
+        await a.receive(segment(ports: (80, local), sequence: 501, ack: end, flags: 0x10, window: 65_535))
+        // Slow start from one segment: the ACK opens three, and those three six.
+        let next = try await waitForSegments(log, from: afterTimeouts, 3)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let sentNext = await dataSegments(log, from: afterTimeouts)
+        XCTAssertEqual(sentNext.count, 3)
+        let beforeRound = await log.packets.count
+        for (sequence, length) in next {
+            await a.receive(segment(ports: (80, local), sequence: 501, ack: sequence &+ UInt32(length), flags: 0x10, window: 65_535))
+        }
+        _ = try await waitForSegments(log, from: beforeRound, 6)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let round = await dataSegments(log, from: beforeRound)
+        XCTAssertEqual(round.count, 6)
+        await a.close()
+        _ = try? await writer.value
+    }
+
     /// A segment from B to A, as a stack other than this one would send it.
     private func segment(ports: (UInt16, UInt16) = (4000, 80), sequence: UInt32, ack: UInt32, flags: UInt8,
                          window: UInt16, options: [UInt8] = [], payload: [UInt8] = []) -> Data {

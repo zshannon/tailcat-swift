@@ -59,6 +59,9 @@ internal actor IPStack {
         var congestionWindow = 4880
         var slowStartThreshold = IPStack.sendWindowLimit
         var duplicateACKs = 0
+        /// SND.NXT when loss recovery began; until it is acknowledged, each
+        /// partial ACK retransmits the next hole (RFC 6582).
+        var recover: UInt32?
         var retransmitDelay: TimeInterval = 0.5
         var segments: [Segment] = []
         var incoming: [Incoming] = []
@@ -471,10 +474,10 @@ internal actor IPStack {
         if acknowledgement == state.sendUnacknowledged && payload.isEmpty && flags & 1 == 0 &&
             oldWindow == state.remoteWindow && !state.segments.isEmpty {
             state.duplicateACKs += 1
-            if state.duplicateACKs == 3, let first = state.segments.first {
-                state.slowStartThreshold = max(state.mss * 2, state.congestionWindow / 2)
+            if state.duplicateACKs == 3, state.recover == nil, !state.segments.isEmpty {
+                enterRecovery(state)
                 state.congestionWindow = state.slowStartThreshold
-                retransmit(state, first)
+                resend(state)
             }
         } else if Self.before(state.sendUnacknowledged, acknowledgement) {
             acknowledge(state, acknowledgement)
@@ -566,8 +569,13 @@ internal actor IPStack {
                     payload: Data(first.payload.dropFirst(count)), sent: first.sent, retries: first.retries)
             }
         }
+        if let recover = state.recover {
+            if Self.before(ack, recover) { if !state.segments.isEmpty { resend(state) } }
+            else { state.recover = nil }
+        }
         if advanced > 0 {
-            let increment = state.congestionWindow < state.slowStartThreshold ? min(advanced, state.mss) :
+            // A delayed ACK covers two segments (RFC 3465, L = 2).
+            let increment = state.congestionWindow < state.slowStartThreshold ? min(advanced, 2 * state.mss) :
                 max(1, state.mss * min(advanced, state.mss) / max(1, state.congestionWindow))
             state.congestionWindow = min(Self.sendWindowLimit, state.congestionWindow + increment)
         }
@@ -666,6 +674,19 @@ internal actor IPStack {
         emit(tcpPacket(state.key, sequence: segment.sequence, ack: state.receiveNext,
                        flags: segment.flags, window: advertise(state, syn: syn), payload: segment.payload,
                        windowScale: syn && state.offersScale ? windowShift : nil))
+    }
+
+    /// Halves the flight, not the congestion window, which an earlier timeout
+    /// may already have cut to a segment (RFC 5681 equation 4).
+    private func enterRecovery(_ state: TCPState) {
+        state.slowStartThreshold = max(2 * state.mss, Int(state.sendNext &- state.sendUnacknowledged) / 2)
+        state.recover = state.sendNext
+    }
+
+    /// Retransmits the first unacknowledged segment, restarting its timer.
+    private func resend(_ state: TCPState) {
+        state.segments[0].sent = ProcessInfo.processInfo.systemUptime
+        retransmit(state, state.segments[0])
     }
 
     private func sendACK(_ state: TCPState) {
@@ -935,12 +956,11 @@ internal actor IPStack {
             }
             if let first = state.segments.first, now - first.sent >= state.retransmitDelay {
                 if first.retries >= 8 { fail(state.id, error: TailcatTransportError.timedOut); continue }
-                state.slowStartThreshold = max(state.mss * 2, state.congestionWindow / 2)
+                enterRecovery(state)
                 state.congestionWindow = state.mss
                 state.retransmitDelay = min(8, state.retransmitDelay * 2)
-                state.segments[0].sent = now
                 state.segments[0].retries += 1
-                retransmit(state, state.segments[0])
+                resend(state)
             }
             if state.remoteWindow == 0 && (!state.writes.isEmpty || state.writeClosed) && now - state.persistSent >= 1 {
                 state.persistSent = now
