@@ -244,6 +244,8 @@ internal actor TailcatEngine {
         var acknowledged = false
         var lastMeow = Date.distantPast
         var lastHandshake = Date.distantPast
+        /// The client's first initiation, sent with its first meow: resent as is until meowed.
+        var earlyInitiation: Data?
         /// Woken with an expired session: rekey at the next tick, before anything is sent.
         var rekeyNow = false
         var lastSend = Date()
@@ -446,7 +448,20 @@ internal actor TailcatEngine {
                 admitting[node] = (attempt, task)
             } else if !server, data.count >= 5, data[4] == 2, packet.source == address.serverPublicKey.rawValue {
                 startupTrace?.record("meowAcknowledged")
-                peers[packet.source]?.acknowledged = true
+                guard var peer = peers[packet.source] else { return }
+                let early = peer.earlyInitiation
+                peer.acknowledged = true; peer.earlyInitiation = nil
+                if let early, !peer.wireguard.isEstablished {
+                    // Every early copy may have come before the server admitted us: one more
+                    // is answered now. If one was taken and its response lost, the rest are
+                    // replays, so a fresh initiation follows after twice the meow's round trip.
+                    let now = Date(), retry = max(0.3, 2 * now.timeIntervalSince(peer.lastMeow))
+                    peer.lastHandshake = now - 5 + retry; peers[packet.source] = peer
+                    try? await network.send(to: packet.source, packet: early)
+                    Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: UInt64((retry + 0.001) * 1_000_000_000)); await self?.tick()
+                    }
+                } else { peers[packet.source] = peer }
                 try? await tickThrowing()
             }
             return
@@ -654,6 +669,12 @@ internal actor TailcatEngine {
         let pending = peer.pending; peer.pending.removeAll(); peer.pendingBytes = 0; peers[node] = peer
         for packet in pending { try? await sendPayload(packet, to: node) }
     }
+    /// Until meowed or established; false once there is no reason to resend.
+    private func resendEarlyInitiation(_ early: Data) async -> Bool {
+        let node = address.serverPublicKey.rawValue
+        guard !closed, let peer = peers[node], peer.earlyInitiation == early, !peer.wireguard.isEstablished else { return false }
+        try? await network.send(to: node, packet: early); return true
+    }
     private func tick() async { try? await tickThrowing() }
     private func tickThrowing() async throws {
         guard !closed else { throw TailcatError.closed }
@@ -679,11 +700,27 @@ internal actor TailcatEngine {
         if !server, peers[address.serverPublicKey.rawValue]?.acknowledged == false {
             var peer = peers[address.serverPublicKey.rawValue]!
             if now.timeIntervalSince(peer.lastMeow) >= 1 {
-                peer.lastMeow = now; peers[address.serverPublicKey.rawValue] = peer
+                // The first meow carries the initiation rather than waiting a round trip for
+                // meowed. The server drops it until it has admitted us, so the same bytes go
+                // again a few times; once a copy is taken, the rest are replays it drops.
+                let early = peer.lastMeow == .distantPast ? try peer.wireguard.initiateHandshake(now: now) : nil
+                peer.lastMeow = now
+                if let early { peer.lastHandshake = now; peer.earlyInitiation = early }
+                peers[address.serverPublicKey.rawValue] = peer
                 let meow = Data("meow\u{01}".utf8) + publicKey.rawValue + (try key.discoPublicKey)
                 startupTrace?.record("meowSendStarted")
                 try await network.send(to: address.serverPublicKey.rawValue, packet: meow)
                 startupTrace?.record("meowWritten")
+                if let early {
+                    startupTrace?.record("wireGuardInitiationSendStarted")
+                    try await network.send(to: address.serverPublicKey.rawValue, packet: early)
+                    Task { [weak self] in
+                        for milliseconds: UInt64 in [5, 10, 20, 40, 80] {
+                            try? await Task.sleep(nanoseconds: milliseconds * 1_000_000)
+                            guard let self, await self.resendEarlyInitiation(early) else { return }
+                        }
+                    }
+                }
             }
         }
         for node in Array(peers.keys) {

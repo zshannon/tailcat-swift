@@ -63,6 +63,7 @@ final class LocalRelay: @unchecked Sendable {
     private var authenticated = 0
     private var initiations = 0
     private var initiationsToDrop = 0
+    private var drops = [(count: Int, matches: @Sendable (Data) -> Bool)]()
     private var clientNonces = [Data]()
 
     var serverPublicKey: Data { get throws { try NaClBox.publicKey(for: privateKey) } }
@@ -170,6 +171,7 @@ final class LocalRelay: @unchecked Sendable {
                     }
                     var target = peers[destination].flatMap { silent.contains(ObjectIdentifier($0)) ? nil : $0 }
                     if WireGuard.packetType(packet) == 1, initiationsToDrop > 0 { initiationsToDrop -= 1; target = nil }
+                    if let index = drops.firstIndex(where: { $0.count > 0 && $0.matches(packet) }) { drops[index].count -= 1; target = nil }
                     lock.unlock()
                     try? target?.send(DERPFrame.encode(type: 5, payload: key + frame.payload.dropFirst(32)))
                 } else if frame.type == 0x12 {
@@ -197,6 +199,11 @@ final class LocalRelay: @unchecked Sendable {
 
     /// The next `count` handshake initiations are lost, as into a connection that died.
     func dropInitiations(_ count: Int) { lock.lock(); initiationsToDrop = count; lock.unlock() }
+
+    /// The next `count` relayed packets that match are lost.
+    func drop(_ count: Int, where matches: @escaping @Sendable (Data) -> Bool) {
+        lock.lock(); drops.append((count, matches)); lock.unlock()
+    }
 
     /// The source's current connection goes silent, as one that died without
     /// a reset: frames are read and dropped and nothing goes out on it.
