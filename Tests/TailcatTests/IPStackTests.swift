@@ -117,6 +117,11 @@ private actor PacketCapture {
     func record(_ packet: Data) { self.packet = packet }
 }
 
+private actor PacketLog {
+    private(set) var packets: [Data] = []
+    func record(_ packet: Data) { packets.append(packet) }
+}
+
 private actor CompletionFlag {
     private(set) var completed = false
     func finish() { completed = true }
@@ -126,10 +131,11 @@ final class IPStackTests: XCTestCase {
     private let addressA = Data([0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0] + [UInt8](repeating: 0, count: 9) + [1])
     private let addressB = Data([0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0] + [UInt8](repeating: 0, count: 9) + [2])
 
-    private func pair(_ faults: PacketLink.Faults = .init()) async -> (IPStack, IPStack, PacketLink) {
+    private func pair(_ faults: PacketLink.Faults = .init(),
+                      receiveCapacity: Int = 1 << 20) async -> (IPStack, IPStack, PacketLink) {
         let link = PacketLink(faults: faults)
-        let a = IPStack(address: addressA) { await link.send($0, fromA: true) }
-        let b = IPStack(address: addressB) { await link.send($0, fromA: false) }
+        let a = IPStack(address: addressA, receiveCapacity: receiveCapacity) { await link.send($0, fromA: true) }
+        let b = IPStack(address: addressB, receiveCapacity: receiveCapacity) { await link.send($0, fromA: false) }
         await link.attach(a, b)
         return (a, b, link)
     }
@@ -372,7 +378,7 @@ final class IPStackTests: XCTestCase {
     }
 
     func testLateResetAfterBothFINsPreservesBufferedTailAndEOF() async throws {
-        let (a, b, link) = await pair()
+        let (a, b, link) = await pair(receiveCapacity: 65_535)
         let listener = try await b.listen(port: 86)
         let peer = addressB
         // Nearly the whole receive window, so that reading reopens it by more
@@ -425,7 +431,7 @@ final class IPStackTests: XCTestCase {
     }
 
     func testZeroWindowBackpressureAndReopen() async throws {
-        let (a, b, link) = await pair()
+        let (a, b, link) = await pair(receiveCapacity: 65_535)
         let listener = try await b.listen(port: 321)
         let peer = addressB
         let bytes = Data(repeating: 0xa7, count: 300_000)
@@ -474,8 +480,191 @@ final class IPStackTests: XCTestCase {
         await a.close(); await b.close()
     }
 
+    func testScaledWindowAcknowledgesAnUnreadResponsePastSixtyFourKilobytes() async throws {
+        // Window scaling is negotiated whichever end opens the flow.
+        for aConnects in [true, false] {
+            let (a, b, link) = await pair()
+            let (opener, listening) = aConnects ? (a, b) : (b, a)
+            let peer = aConnects ? addressB : addressA
+            let listener = try await listening.listen(port: 90)
+            let response = Data((0..<900_000).map { UInt8(truncatingIfNeeded: $0 * 13) })
+            try await deadline {
+                let client = try await opener.connect(peer: peer, port: 90)
+                let server = try await listener.accept()
+                // Returns once the client has acknowledged every byte, none of it read.
+                try await server.write(response)
+                try await server.closeWrite()
+                let received = try await self.drain(client)
+                XCTAssertEqual(received, response)
+            }
+            let sawZero = await link.sawZeroWindow
+            XCTAssertFalse(sawZero)
+            await a.close(); await b.close()
+        }
+    }
+
+    func testScaledZeroWindowAndLostUpdateRecover() async throws {
+        // 300,000 bytes take a shift of 3, so windows round down to 8 bytes.
+        let (a, b, link) = await pair(.init(dropReopenWindow: true), receiveCapacity: 300_000)
+        let listener = try await b.listen(port: 91)
+        let peer = addressB
+        let bytes = Data((0..<1_000_000).map { UInt8(truncatingIfNeeded: $0 * 29) })
+        try await deadline {
+            let client = try await a.connect(peer: peer, port: 91)
+            let server = try await listener.accept()
+            let writer = Task {
+                try await client.write(bytes)
+                try await client.closeWrite()
+            }
+            for _ in 0..<200 {
+                if await link.sawZeroWindow { break }
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            let zero = await link.sawZeroWindow
+            XCTAssertTrue(zero)
+            // The first reopened window is lost; the sender's persist probe recovers.
+            let received = try await self.drain(server)
+            XCTAssertEqual(received, bytes)
+            try await writer.value
+            let drops = await link.drops
+            XCTAssertEqual(drops, 1)
+        }
+        await a.close(); await b.close()
+    }
+
+    func testListenerScalesOnlyForAPeerThatOffersScaling() async throws {
+        for peerShift: UInt8? in [nil, 7] {
+            let log = PacketLog()
+            let a = IPStack(address: addressA) { await log.record($0) }
+            let listener = try await a.listen(port: 80)
+            let scale: [UInt8] = peerShift.map { [1, 3, 3, $0] } ?? []
+            await a.receive(segment(sequence: 100, ack: 0, flags: 0x02, window: 2000,
+                                    options: [2, 4, 0x04, 0xc4] + scale))
+            let synACK = try await sent(log, count: 1)[0]
+            XCTAssertEqual(synACK[53], 0x12)
+            XCTAssertEqual(windowScale(synACK), peerShift == nil ? nil : 5)
+            XCTAssertEqual(window(synACK), 65_535)
+            // Scaled by 2^7, the peer's ten opens 1,280 bytes; unscaled, 10.
+            await a.receive(segment(sequence: 101, ack: sequenceNumber(synACK) &+ 1, flags: 0x10, window: 10))
+            let server = try await deadline { try await listener.accept() }
+            let writer = Task { try await server.write(Data(repeating: 1, count: 5000)) }
+            let allowed = peerShift == nil ? 10 : 1280
+            try await waitForPayload(log, allowed)
+            let before = await log.packets.count
+            await a.receive(segment(sequence: 101, ack: sequenceNumber(synACK) &+ 1, flags: 0x18,
+                                    window: 10, payload: [UInt8](repeating: 2, count: 1000)))
+            let ack = try await sent(log, count: before + 1)[before]
+            XCTAssertEqual(acknowledgementNumber(ack), 1101)
+            XCTAssertEqual(window(ack), peerShift == nil ? 65_535 : UInt16(((1 << 20) - 1000) >> 5))
+            let total = payloadCount(await log.packets)
+            XCTAssertEqual(total, allowed)
+            await a.close()
+            _ = try? await writer.value
+        }
+    }
+
+    func testConnectorFallsBackToUnscaledWindowsWithoutPeerOption() async throws {
+        for peerShift: UInt8? in [nil, 2] {
+            let log = PacketLog()
+            let a = IPStack(address: addressA) { await log.record($0) }
+            let peer = addressB
+            let connect = Task { try await a.connect(peer: peer, port: 80) }
+            let syn = try await sent(log, count: 1)[0]
+            XCTAssertEqual(syn[53], 0x02)
+            XCTAssertEqual(windowScale(syn), 5)
+            XCTAssertEqual(window(syn), 65_535)
+            let local = UInt16(syn[40]) << 8 | UInt16(syn[41])
+            let scale: [UInt8] = peerShift.map { [1, 3, 3, $0] } ?? []
+            // A SYN-ACK's own window is never scaled.
+            await a.receive(segment(ports: (80, local), sequence: 500, ack: sequenceNumber(syn) &+ 1, flags: 0x12,
+                                    window: 2000, options: [2, 4, 0x04, 0xc4] + scale))
+            let client = try await deadline { try await connect.value }
+            let handshakeACK = try await sent(log, count: 2)[1]
+            XCTAssertEqual(window(handshakeACK), peerShift == nil ? 65_535 : 32_768)
+            let writer = Task { try await client.write(Data(repeating: 1, count: 10_000)) }
+            try await waitForPayload(log, 2000)
+            // The peer acknowledges both segments and opens 1,000 << shift.
+            await a.receive(segment(ports: (80, local), sequence: 501, ack: sequenceNumber(syn) &+ 2001,
+                                    flags: 0x10, window: 1000))
+            let opened = peerShift == nil ? 1000 : 4000
+            try await waitForPayload(log, 2000 + opened)
+            await a.close()
+            _ = try? await writer.value
+        }
+    }
+
+    /// A segment from B to A, as a stack other than this one would send it.
+    private func segment(ports: (UInt16, UInt16) = (4000, 80), sequence: UInt32, ack: UInt32, flags: UInt8,
+                         window: UInt16, options: [UInt8] = [], payload: [UInt8] = []) -> Data {
+        var tcp = [UInt8](repeating: 0, count: 20) + options + payload
+        func put16(_ offset: Int, _ value: UInt16) {
+            tcp[offset] = UInt8(value >> 8); tcp[offset + 1] = UInt8(truncatingIfNeeded: value)
+        }
+        put16(0, ports.0); put16(2, ports.1)
+        put16(4, UInt16(sequence >> 16)); put16(6, UInt16(truncatingIfNeeded: sequence))
+        put16(8, UInt16(ack >> 16)); put16(10, UInt16(truncatingIfNeeded: ack))
+        tcp[12] = UInt8((20 + options.count) / 4) << 4
+        tcp[13] = flags
+        put16(14, window)
+        let summed = [UInt8](addressB + addressA) + tcp + (tcp.count % 2 == 1 ? [0] : [])
+        var sum = UInt32(tcp.count) + 6
+        for index in stride(from: 0, to: summed.count, by: 2) { sum += UInt32(summed[index]) << 8 | UInt32(summed[index + 1]) }
+        while sum >> 16 != 0 { sum = (sum & 0xffff) + (sum >> 16) }
+        put16(16, ~UInt16(sum))
+        var ip = [UInt8](repeating: 0, count: 40)
+        ip[0] = 0x60; ip[4] = UInt8(tcp.count >> 8); ip[5] = UInt8(truncatingIfNeeded: tcp.count); ip[6] = 6; ip[7] = 64
+        ip.replaceSubrange(8..<24, with: addressB)
+        ip.replaceSubrange(24..<40, with: addressA)
+        return Data(ip + tcp)
+    }
+
+    private func sent(_ log: PacketLog, count: Int) async throws -> [Data] {
+        for _ in 0..<200 {
+            let packets = await log.packets
+            if packets.count >= count { return packets }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("Expected \(count) packets"); throw TailcatTransportError.timedOut
+    }
+
+    /// Waits for exactly this many payload bytes, and then for no more.
+    private func waitForPayload(_ log: PacketLog, _ bytes: Int) async throws {
+        for _ in 0..<200 {
+            if payloadCount(await log.packets) >= bytes { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let total = payloadCount(await log.packets)
+        XCTAssertEqual(total, bytes)
+    }
+
+    private func payloadCount(_ packets: [Data]) -> Int {
+        packets.filter { $0[53] & 0x04 == 0 }.reduce(0) { $0 + $1.count - 40 - Int($1[52] >> 4) * 4 }
+    }
+
+    private func window(_ packet: Data) -> UInt16 { UInt16(packet[54]) << 8 | UInt16(packet[55]) }
+
+    private func sequenceNumber(_ packet: Data) -> UInt32 {
+        packet[44..<48].reduce(0) { $0 << 8 | UInt32($1) }
+    }
+
+    private func acknowledgementNumber(_ packet: Data) -> UInt32 {
+        packet[48..<52].reduce(0) { $0 << 8 | UInt32($1) }
+    }
+
+    private func windowScale(_ packet: Data) -> UInt8? {
+        var offset = 60
+        let end = 40 + Int(packet[52] >> 4) * 4
+        while offset + 1 < end {
+            if packet[offset] == 1 { offset += 1; continue }
+            if packet[offset] == 3 { return packet[offset + 2] }
+            offset += Int(packet[offset + 1])
+        }
+        return nil
+    }
+
     func testLostWindowUpdateAndFinalFINAcknowledgementRecover() async throws {
-        let (a, b, link) = await pair(.init(dropReopenWindow: true, dropFINACK: true))
+        let (a, b, link) = await pair(.init(dropReopenWindow: true, dropFINACK: true), receiveCapacity: 65_535)
         let listener = try await b.listen(port: 81)
         let peer = addressB
         let bytes = Data(repeating: 0x7b, count: 90_000)
@@ -508,7 +697,7 @@ final class IPStackTests: XCTestCase {
     }
 
     func testDrainWaitsForACKsAndLeavesWriteSideOpen() async throws {
-        let (a, b, link) = await pair()
+        let (a, b, link) = await pair(receiveCapacity: 65_535)
         let listener = try await b.listen(port: 82)
         let peer = addressB
         let payload = Data(repeating: 0x32, count: 100_000)
@@ -541,7 +730,7 @@ final class IPStackTests: XCTestCase {
     }
 
     func testCloseFlushesQueuedBytesAndDiscardsIncomingWithoutReset() async throws {
-        let (a, b, link) = await pair()
+        let (a, b, link) = await pair(receiveCapacity: 65_535)
         let listener = try await b.listen(port: 83)
         let peer = addressB
         let payload = Data(repeating: 0x42, count: 180_000)
