@@ -156,11 +156,34 @@ public actor TailcatClient {
         trace?.record("connectStarted")
         let key = try configuration.privateKey ?? NodePrivateKey.generate()
         trace?.record("identityGenerated")
-        let expanded = try await address.expanded(mapURL: configuration.mapURL, cache: configuration.mapCache)
+        let (expanded, saved) = try await address.expanding(mapURL: configuration.mapURL, cache: configuration.mapCache, forServer: false)
         trace?.record("addressExpanded")
         guard let disco = expanded.serverDiscoPublicKey, disco.count == 32, disco.contains(where: { $0 != 0 }) else {
             throw TailcatError.invalidAddress("server discovery key is required")
         }
+        guard saved else { return try await connectExpanded(to: expanded, key: key, configuration: configuration) }
+        return try await connectRecovering(to: expanded, key: key, configuration: configuration)
+    }
+    /// A saved map can be out of date. If its relay fails, or hasn't connected
+    /// within three seconds, the map is revalidated; if the region changed,
+    /// that attempt is dropped and one more is made with the current region.
+    private static func connectRecovering(to address: TailcatAddress, key: NodePrivateKey, configuration: Configuration) async throws -> TailcatClient {
+        let first = Task { try await connectExpanded(to: address, key: key, configuration: configuration) }
+        return try await withTaskCancellationHandler(operation: {
+            if case .success(let client)? = await first.result(within: 3) { return client }
+            try Task.checkCancellation()
+            let region = address.regions[0]
+            guard let map = await DERPMap.refresh(url: configuration.mapURL, cache: configuration.mapCache, forServer: false),
+                  let current = map.regions[region.regionID], current != region else { return try await first.value }
+            first.cancel()
+            if case .success(let client) = await first.result { return client }
+            configuration.startupTrace?.record("relayMapRefreshed")
+            var retry = address; retry.regions = [current]
+            return try await connectExpanded(to: retry, key: key, configuration: configuration)
+        }, onCancel: { first.cancel() })
+    }
+    private static func connectExpanded(to expanded: TailcatAddress, key: NodePrivateKey, configuration: Configuration) async throws -> TailcatClient {
+        let trace = configuration.startupTrace
         var transportConfiguration = TailcatServer.Configuration()
         transportConfiguration.relayFirst = configuration.relayFirst
         transportConfiguration.directDiscovery = configuration.directDiscovery
@@ -207,6 +230,28 @@ public actor TailcatClient {
     /// This client's TCP flows to the server, open and closing, against
     /// the budgets in `TailcatFlowStatistics`.
     public var flowStatistics: TailcatFlowStatistics { get async { await engine.flowStatistics() } }
+}
+
+private extension Task where Failure == Error {
+    /// The result, if the task finishes within `seconds`; it isn't cancelled if not.
+    func result(within seconds: TimeInterval) async -> Result<Success, Error>? {
+        let once = ResumeOnce<Result<Success, Error>?>()
+        return await withCheckedContinuation { continuation in
+            once.set(continuation)
+            Task<Void, Never> { once.resume(await self.result) }
+            Task<Void, Never> { try? await Task<Never, Never>.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)); once.resume(nil) }
+        }
+    }
+}
+
+private final class ResumeOnce<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Never>?
+    func set(_ continuation: CheckedContinuation<T, Never>) { lock.lock(); self.continuation = continuation; lock.unlock() }
+    func resume(_ value: T) {
+        lock.lock(); let continuation = self.continuation; self.continuation = nil; lock.unlock()
+        continuation?.resume(returning: value)
+    }
 }
 
 /// Owns session state, binds authenticated node identities to tunnel IPs, and drives protocol timers.
