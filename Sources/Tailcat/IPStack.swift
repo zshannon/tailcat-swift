@@ -71,7 +71,9 @@ internal actor IPStack {
         var recover: UInt32?
         var retransmitDelay: TimeInterval = 0.5
         var segments: [Segment] = []
+        /// Held out of order, by sequence.
         var incoming: [Incoming] = []
+        var incomingBytes = 0
         var buffer = Data()
         var reads: [ReadWaiter] = []
         var writes: [WriteWaiter] = []
@@ -645,7 +647,7 @@ internal actor IPStack {
     }
 
     private func receiveWindow(_ state: TCPState) -> Int {
-        let used = state.buffer.count + state.incoming.reduce(0) { $0 + $1.payload.count }
+        let used = state.buffer.count + state.incomingBytes
         return max(0, receiveCapacity - used)
     }
 
@@ -683,12 +685,14 @@ internal actor IPStack {
             }
             // Enough segments for a whole window lost behind one hole.
             if !state.incoming.contains(where: { $0.sequence == seq && $0.payload.count >= data.count }) && state.incoming.count < 1024 {
-                state.incoming.append(Incoming(sequence: seq, payload: data, fin: acceptedFIN))
+                let index = state.incoming.firstIndex { Self.before(seq, $0.sequence) } ?? state.incoming.endIndex
+                state.incoming.insert(Incoming(sequence: seq, payload: data, fin: acceptedFIN), at: index)
+                state.incomingBytes += data.count
             }
         }
-        state.incoming.sort { Self.before($0.sequence, $1.sequence) }
         while let first = state.incoming.first, !Self.before(state.receiveNext, first.sequence), !state.readEOF {
             state.incoming.removeFirst()
+            state.incomingBytes -= first.payload.count
             let skip = Int(state.receiveNext &- first.sequence)
             if skip <= first.payload.count {
                 let tail = first.payload.dropFirst(skip)
@@ -698,7 +702,7 @@ internal actor IPStack {
             }
         }
         if state.readEOF {
-            state.incoming.removeAll()
+            state.incoming.removeAll(); state.incomingBytes = 0
             if state.finAcknowledged { state.finishedAt = ProcessInfo.processInfo.systemUptime }
         }
         satisfyReads(state)

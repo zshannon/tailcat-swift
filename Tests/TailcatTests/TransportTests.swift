@@ -134,19 +134,31 @@ final class TransportTests: XCTestCase {
         let source = try DiscoveryEndpoint("192.0.2.1:1234")
         XCTAssertEqual(ingress.offer(Data(repeating: 0, count: UDPIngress.maximumDatagramSize + 1), from: source), .rejected)
         var dropped = 0
-        for index in 0..<1000 {
+        let offered = UDPIngress.capacity + 744
+        for index in 0..<offered {
             let packet = Data([UInt8(index >> 8),UInt8(truncatingIfNeeded: index)])
             if ingress.offer(packet, from: source) == .overflow { dropped += 1 }
         }
-        XCTAssertEqual(dropped, 1000 - UDPIngress.capacity)
+        XCTAssertEqual(dropped, offered - UDPIngress.capacity)
         ingress.finish()
         var delivered = [Int]()
         for await packet in ingress.packets {
             XCTAssertEqual(packet.source, source)
             delivered.append(Int(packet.payload[0]) << 8 | Int(packet.payload[1]))
         }
-        XCTAssertEqual(delivered, Array((1000 - UDPIngress.capacity)..<1000))
+        XCTAssertEqual(delivered, Array((offered - UDPIngress.capacity)..<offered))
         XCTAssertEqual(ingress.offer(Data([1]), from: source), .rejected)
+    }
+
+    func testUDPIngressHoldsAFullWindowAndCountsWhatItDrops() throws {
+        let ingress = UDPIngress()
+        let source = try DiscoveryEndpoint("192.0.2.1:1234")
+        let packet = Data(repeating: 0, count: 1280)
+        for _ in 0..<1024 { XCTAssertEqual(ingress.offer(packet, from: source), .queued) }
+        XCTAssertEqual(ingress.dropped, 0)
+        XCTAssertEqual(ingress.offer(packet, from: source), .overflow)
+        XCTAssertEqual(ingress.dropped, 1)
+        ingress.finish()
     }
 
     func testLiveDERPRoundTrip() async throws {

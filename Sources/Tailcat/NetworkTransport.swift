@@ -42,11 +42,15 @@ struct UDPDatagram: Sendable {
 
 /// Bounds unauthenticated work before it can enter the transport actor's mailbox.
 struct UDPIngress: Sendable {
-    static let capacity = 256
+    /// A full receive window, as on the relay: a slower reader must not drop a burst.
+    static let capacity = DERPTransport.receiveCapacity
     static let maximumDatagramSize = 2048 // Tailcat's 1280-byte IP MTU plus WireGuard overhead.
     enum OfferResult: Equatable { case queued, overflow, rejected }
     let packets: AsyncStream<UDPDatagram>
     private let continuation: AsyncStream<UDPDatagram>.Continuation
+    private let overflows = OverflowCount()
+    /// Datagrams dropped because the reader fell `capacity` behind.
+    var dropped: Int { overflows.value }
     init() {
         var output: AsyncStream<UDPDatagram>.Continuation!
         packets = AsyncStream(bufferingPolicy: .bufferingNewest(Self.capacity)) { output = $0 }
@@ -57,12 +61,20 @@ struct UDPIngress: Sendable {
         guard packet.count <= Self.maximumDatagramSize else { return .rejected }
         switch continuation.yield(UDPDatagram(payload: packet, source: endpoint)) {
         case .enqueued: return .queued
-        case .dropped: return .overflow
+        case .dropped: overflows.add(); return .overflow
         case .terminated: return .rejected
         @unknown default: return .rejected
         }
     }
     func finish() { continuation.finish() }
+}
+
+/// Offers arrive on the socket's queue, outside the actor.
+private final class OverflowCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+    func add() { lock.lock(); count += 1; lock.unlock() }
 }
 
 /// The UDP socket can no longer send, whatever the destination.
@@ -289,8 +301,10 @@ public actor NetworkTransport {
     public nonisolated let packets: AsyncThrowingStream<TransportPacket, Error>
     private let continuation: AsyncThrowingStream<TransportPacket, Error>.Continuation
     private var dropped = 0
-    /// Received packets dropped because the engine fell `DERPTransport.receiveCapacity` behind.
-    public var receiveDrops: Int { get async { await relay.receiveDrops + dropped } }
+    /// Dropped by UDP ingresses already replaced.
+    private var retiredIngressDrops = 0
+    /// Received packets dropped because the engine or this actor fell `DERPTransport.receiveCapacity` behind.
+    public var receiveDrops: Int { get async { await relay.receiveDrops + dropped + retiredIngressDrops + (udpIngress?.dropped ?? 0) } }
     private let privateKey: Data
     private var nodePublicKey: Data?
     private let discoPrivateKey: Data
@@ -431,7 +445,7 @@ public actor NetworkTransport {
                 resetNetwork()
             }
         } catch {
-            udpIngress?.finish(); udpIngress = nil; udpReader?.cancel(); udpReader = nil
+            retireUDPIngress(); udpReader?.cancel(); udpReader = nil
             udp?.close(); udp = nil; throw error
         }
     }
@@ -720,7 +734,7 @@ public actor NetworkTransport {
             peers[key]?.lastCall = .distantPast
         }
         discoveryTask?.cancel()
-        udpIngress?.finish(); udpIngress = nil; udpReader?.cancel(); udpReader = nil
+        retireUDPIngress(); udpReader?.cancel(); udpReader = nil
         udp?.close(); udp = nil
         scheduleDiscovery()
     }
@@ -738,7 +752,7 @@ public actor NetworkTransport {
         for key in peers.keys { requestRelayMarker(to: key) }
         discoveryTask?.cancel()
         resetDirectPaths()
-        udpIngress?.finish(); udpIngress = nil; udpReader?.cancel(); udpReader = nil
+        retireUDPIngress(); udpReader?.cancel(); udpReader = nil
         udp?.close(); udp = nil; interfaceEndpoints.removeAll(); stunServers.removeAll()
         let generation = networkGeneration
         resetTask = Task { [weak self, relay] in
@@ -897,7 +911,7 @@ public actor NetworkTransport {
         pendingProbes.removeAll()
         for marker in relayMarkers.values { marker.task?.cancel() }; relayMarkers.removeAll()
         for task in invitationTasks.values { task.cancel() }; invitationTasks.removeAll()
-        udpIngress?.finish(); udpIngress = nil; udpReader?.cancel(); udpReader = nil
+        retireUDPIngress(); udpReader?.cancel(); udpReader = nil
         #if canImport(Network)
         pathMonitor?.cancel(); pathMonitor = nil
         #endif
@@ -916,6 +930,11 @@ public actor NetworkTransport {
             if Self.carriesData(packet.payload) { peers[packet.source]?.lastActivity = Date() }
             deliver(TransportPacket(source: packet.source, payload: packet.payload, viaRelay: true))
         }
+    }
+
+    private func retireUDPIngress() {
+        retiredIngressDrops += udpIngress?.dropped ?? 0
+        udpIngress?.finish(); udpIngress = nil
     }
 
     private func deliver(_ packet: TransportPacket) {
