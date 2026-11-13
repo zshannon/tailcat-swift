@@ -115,6 +115,54 @@ private actor PacketLink {
     }
 }
 
+/// Delivers each way in order after `delay`, and drops the data segments B
+/// sends whose index (from zero) is in `dropFromB`, recording when they and
+/// their retransmissions went out.
+private actor DelayLink {
+    private var a: IPStack?
+    private var b: IPStack?
+    private let delay: UInt64
+    private let dropFromB: Set<Int>
+    private var dataFromB = 0
+    private var toA: AsyncStream<(UInt64, Data)>.Continuation?
+    private var toB: AsyncStream<(UInt64, Data)>.Continuation?
+    /// When each dropped segment's sequence was dropped, and when it was sent again.
+    private(set) var dropped: [UInt32: TimeInterval] = [:]
+    private(set) var repaired: [UInt32: TimeInterval] = [:]
+
+    init(delay: TimeInterval, dropFromB: Set<Int>) {
+        self.delay = UInt64(delay * 1_000_000_000); self.dropFromB = dropFromB
+    }
+
+    func attach(_ a: IPStack, _ b: IPStack) {
+        self.a = a; self.b = b
+        for (target, toA) in [(a, true), (b, false)] {
+            let (stream, continuation) = AsyncStream<(UInt64, Data)>.makeStream()
+            if toA { self.toA = continuation } else { self.toB = continuation }
+            Task {
+                for await (due, packet) in stream {
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    if due > now { try? await Task.sleep(nanoseconds: due - now) }
+                    await target.receive(packet)
+                }
+            }
+        }
+    }
+
+    func send(_ data: Data, fromA: Bool) {
+        if !fromA, data.count > 60, data[6] == 6, data.count - 40 - Int(data[52] >> 4) * 4 > 0 {
+            let sequence = data[44..<48].reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
+            let now = ProcessInfo.processInfo.systemUptime
+            if dropped[sequence] != nil, repaired[sequence] == nil { repaired[sequence] = now }
+            defer { dataFromB += 1 }
+            if dropFromB.contains(dataFromB) { dropped[sequence] = now; return }
+        }
+        (fromA ? toB : toA)?.yield((DispatchTime.now().uptimeNanoseconds + delay, data))
+    }
+
+    func close() { toA?.finish(); toB?.finish() }
+}
+
 private actor PacketCapture {
     var packet: Data?
     func record(_ packet: Data) { self.packet = packet }
@@ -598,14 +646,14 @@ final class IPStackTests: XCTestCase {
     }
 
     /// A connection from A to a hand-driven peer that scales its window by 2^7.
-    private func scriptedSender(_ log: PacketLog) async throws -> (IPStack, TailcatConnection, UInt16, UInt32) {
+    private func scriptedSender(_ log: PacketLog, sack: Bool = false) async throws -> (IPStack, TailcatConnection, UInt16, UInt32) {
         let a = IPStack(address: addressA) { await log.record($0) }
         let peer = addressB
         let connect = Task { try await a.connect(peer: peer, port: 80) }
         let syn = try await sent(log, count: 1)[0]
         let local = UInt16(syn[40]) << 8 | UInt16(syn[41])
         await a.receive(segment(ports: (80, local), sequence: 500, ack: sequenceNumber(syn) &+ 1, flags: 0x12,
-                                window: 65_535, options: [2, 4, 0x04, 0xc4, 1, 3, 3, 7]))
+                                window: 65_535, options: [2, 4, 0x04, 0xc4, 1, 3, 3, 7] + (sack ? [1, 1, 4, 2] : [])))
         let client = try await deadline { try await connect.value }
         return (a, client, local, sequenceNumber(syn) &+ 1)
     }
@@ -690,6 +738,155 @@ final class IPStackTests: XCTestCase {
         XCTAssertEqual(round.count, 6)
         await a.close()
         _ = try? await writer.value
+    }
+
+    func testSACKIsNegotiatedOnlyWhenBothSYNsOfferIt() async throws {
+        for peerSACK in [false, true] {
+            // As the connector: our SYN offers it; ACKs report held data only if the SYN-ACK agreed.
+            let log = PacketLog()
+            let a = IPStack(address: addressA) { await log.record($0) }
+            let peer = addressB
+            let connect = Task { try await a.connect(peer: peer, port: 80) }
+            let syn = try await sent(log, count: 1)[0]
+            XCTAssertNotNil(option(syn, 4))
+            let local = UInt16(syn[40]) << 8 | UInt16(syn[41])
+            await a.receive(segment(ports: (80, local), sequence: 500, ack: sequenceNumber(syn) &+ 1, flags: 0x12,
+                                    window: 65_535, options: [2, 4, 0x04, 0xc4] + (peerSACK ? [1, 1, 4, 2] : [])))
+            _ = try await deadline { try await connect.value }
+            // The first segment is lost; the second arrives.
+            await a.receive(segment(ports: (80, local), sequence: 1721, ack: sequenceNumber(syn) &+ 1, flags: 0x18,
+                                    window: 65_535, payload: [UInt8](repeating: 1, count: 1220)))
+            let ack = try await sent(log, count: 3)[2]
+            XCTAssertEqual(acknowledgementNumber(ack), 501)
+            XCTAssertEqual(sackBlocks(ack), peerSACK ? [[1721, 2941]] : [])
+            await a.close()
+
+            // As the listener: the SYN-ACK agrees only to a SYN that offered it.
+            let serverLog = PacketLog()
+            let b = IPStack(address: addressA) { await serverLog.record($0) }
+            _ = try await b.listen(port: 80)
+            await b.receive(segment(sequence: 100, ack: 0, flags: 0x02, window: 65_535,
+                                    options: [2, 4, 0x04, 0xc4] + (peerSACK ? [1, 1, 4, 2] : [])))
+            let synACK = try await sent(serverLog, count: 1)[0]
+            XCTAssertEqual(synACK[53], 0x12)
+            XCTAssertEqual(option(synACK, 4) != nil, peerSACK)
+            await b.close()
+        }
+    }
+
+    func testOutOfOrderDataIsReportedNewestBlockFirst() async throws {
+        let log = PacketLog()
+        let a = IPStack(address: addressA) { await log.record($0) }
+        let peer = addressB
+        let connect = Task { try await a.connect(peer: peer, port: 80) }
+        let syn = try await sent(log, count: 1)[0]
+        let local = UInt16(syn[40]) << 8 | UInt16(syn[41])
+        await a.receive(segment(ports: (80, local), sequence: 500, ack: sequenceNumber(syn) &+ 1, flags: 0x12,
+                                window: 65_535, options: [2, 4, 0x04, 0xc4, 1, 1, 4, 2]))
+        _ = try await deadline { try await connect.value }
+        func deliver(_ index: Int) async throws -> [[UInt32]] {
+            let before = await log.packets.count
+            await a.receive(segment(ports: (80, local), sequence: 501 &+ UInt32(index * 100), ack: sequenceNumber(syn) &+ 1,
+                                    flags: 0x18, window: 65_535, payload: [UInt8](repeating: UInt8(index), count: 100)))
+            let ack = try await sent(log, count: before + 1)[before]
+            XCTAssertEqual(acknowledgementNumber(ack), 501)
+            return sackBlocks(ack)
+        }
+        // Segments 0, 3, 5 and 7 are missing.
+        for index in [1, 2, 4] { _ = try await deliver(index) }
+        let six = try await deliver(6)
+        XCTAssertEqual(six, [[1101, 1201], [901, 1001], [601, 801]])
+        let eight = try await deliver(8)
+        XCTAssertEqual(eight, [[1301, 1401], [1101, 1201], [901, 1001], [601, 801]])
+        // The one that fills a gap reports the merged block first.
+        let five = try await deliver(5)
+        XCTAssertEqual(five, [[901, 1201], [1301, 1401], [601, 801]])
+        await a.close()
+    }
+
+    func testUploadRepairsEveryHoleOfAWindowInOneRound() async throws {
+        let log = PacketLog()
+        let (a, client, local, first) = try await scriptedSender(log, sack: true)
+        let writer = Task { try await client.write(Data(repeating: 1, count: 100 * 1220)) }
+        // Acknowledge each segment on its own until 16 are in flight.
+        var flight = try await waitForSegments(log, from: 0, 4)
+        while flight.count < 16 {
+            let before = await log.packets.count
+            for (sequence, length) in flight {
+                await a.receive(segment(ports: (80, local), sequence: 501, ack: sequence &+ UInt32(length), flags: 0x10, window: 65_535))
+            }
+            flight = try await waitForSegments(log, from: before, 2 * flight.count)
+        }
+        XCTAssertEqual(flight.count, 16)
+        let base = flight[0].0
+        func at(_ index: Int) -> UInt32 { base &+ UInt32(index * 1220) }
+        // Segments 0, 4 and 8 are lost: each other one is reported held as it arrives.
+        let before = await log.packets.count
+        let start = ProcessInfo.processInfo.systemUptime
+        var held: [(Int, Int)] = []
+        for index in 1..<16 where ![4, 8].contains(index) {
+            if let last = held.last, last.1 == index { held[held.count - 1].1 = index + 1 }
+            else { held.append((index, index + 1)) }
+            let newest = held.last!
+            let blocks = [newest] + held.dropLast().reversed()
+            let sack = [UInt8]([1, 1, 5, UInt8(2 + 8 * min(3, blocks.count))]) + blocks.prefix(3).flatMap { block in
+                [at(block.0), at(block.1)].flatMap { value in (0..<4).map { UInt8(truncatingIfNeeded: value >> (24 - 8 * $0)) } }
+            }
+            await a.receive(segment(ports: (80, local), sequence: 501, ack: base, flags: 0x10, window: 65_535, options: sack))
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let resent = await dataSegments(log, from: before).map(\.0).filter { Self.before($0, at(16)) }
+        XCTAssertEqual(resent, [at(0), at(4), at(8)], "every hole once, nothing the peer holds")
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 0.4, "repaired before a retransmission timeout")
+        await a.close()
+        _ = try? await writer.value
+    }
+
+    func testDownloadWithThreeHolesInAWindowRecoversInAboutOneRoundTrip() async throws {
+        // 100 ms round trips; three segments of one window lost on the way to A.
+        let link = DelayLink(delay: 0.05, dropFromB: [32, 36, 40])
+        let a = IPStack(address: addressA) { await link.send($0, fromA: true) }
+        let b = IPStack(address: addressB) { await link.send($0, fromA: false) }
+        await link.attach(a, b)
+        let listener = try await b.listen(port: 80)
+        let connector = Task { try await a.connect(peer: addressB, port: 80) }
+        let server = try await deadline { try await listener.accept() }
+        let client = try await deadline { try await connector.value }
+        let payload = Data((0..<400_000).map { UInt8(truncatingIfNeeded: $0 &* 31) })
+        let writer = Task { try await server.write(payload); try await server.closeWrite() }
+        let received = try await deadline { try await self.drain(client) }
+        XCTAssertEqual(received, payload)
+        let dropped = await link.dropped, repaired = await link.repaired
+        XCTAssertEqual(dropped.count, 3)
+        XCTAssertEqual(Set(repaired.keys), Set(dropped.keys))
+        let recovery = dropped.map { repaired[$0.key]! - $0.value }.max()!
+        print("SACK-DOWNLOAD-RECOVERY \(Int(recovery * 1000))ms")
+        XCTAssertLessThan(recovery, 0.17, "each hole resent about one round trip after its loss")
+        try await writer.value
+        await a.close(); await b.close(); await link.close()
+    }
+
+    private static func before(_ lhs: UInt32, _ rhs: UInt32) -> Bool { Int32(bitPattern: lhs &- rhs) < 0 }
+
+    /// The option of `kind` in a packet this stack sent, from its kind byte on.
+    private func option(_ packet: Data, _ kind: UInt8) -> [UInt8]? {
+        var offset = 60
+        let end = 40 + Int(packet[52] >> 4) * 4
+        while offset < end {
+            if packet[offset] == 0 { return nil }
+            if packet[offset] == 1 { offset += 1; continue }
+            let length = Int(packet[offset + 1])
+            if packet[offset] == kind { return [UInt8](packet[offset..<(offset + length)]) }
+            offset += length
+        }
+        return nil
+    }
+
+    private func sackBlocks(_ packet: Data) -> [[UInt32]] {
+        guard let sack = option(packet, 5) else { return [] }
+        return stride(from: 2, to: sack.count, by: 8).map { offset in
+            [sack[offset..<(offset + 4)], sack[(offset + 4)..<(offset + 8)]].map { $0.reduce(0) { $0 << 8 | UInt32($1) } }
+        }
     }
 
     /// A segment from B to A, as a stack other than this one would send it.
