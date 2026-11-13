@@ -173,10 +173,14 @@ internal actor IPStack {
     /// Bounds a flow's congestion window: at 215 full segments, four flows in
     /// flight still fit the 1024-packet output queue.
     private static let sendWindowLimit = 262_144
+    /// Whether SYNs offer SACK. Off by default: gVisor's RACK recovery, which a peer
+    /// that agrees to SACK uses, stops sending after a timeout that follows a lost flight.
+    private let selectiveAcknowledgments: Bool
 
-    internal init(address: Data, receiveCapacity: Int = 1 << 20,
+    internal init(address: Data, receiveCapacity: Int = 1 << 20, selectiveAcknowledgments: Bool = false,
                   send: @escaping @Sendable (Data) async throws -> Void) {
         self.address = address
+        self.selectiveAcknowledgments = selectiveAcknowledgments
         self.sendPacket = send
         self.receiveCapacity = receiveCapacity
         var shift: UInt8 = 0
@@ -193,6 +197,7 @@ internal actor IPStack {
         let local = try allocatePort(udp: false)
         let state = TCPState(key: FlowKey(peer: peer, localPort: local, remotePort: port),
                              phase: .synSent, sequence: UInt32.random(in: .min ... .max))
+        state.offersSACK = selectiveAcknowledgments
         connections[state.id] = state
         flows[state.key] = state.id
         let id = state.id
@@ -416,7 +421,7 @@ internal actor IPStack {
                     state.sendScale = shift
                     state.receiveScale = windowShift
                 } else { state.offersScale = false }
-                state.sackPermitted = Self.option(4, length: 2, body, headerLength: headerLength) != nil
+                state.sackPermitted = selectiveAcknowledgments && Self.option(4, length: 2, body, headerLength: headerLength) != nil
                 state.offersSACK = state.sackPermitted
                 connections[state.id] = state
                 flows[key] = state.id
@@ -442,7 +447,7 @@ internal actor IPStack {
                 state.sendScale = shift
                 state.receiveScale = windowShift
             }
-            state.sackPermitted = Self.option(4, length: 2, body, headerLength: headerLength) != nil
+            state.sackPermitted = state.offersSACK && Self.option(4, length: 2, body, headerLength: headerLength) != nil
             state.phase = .established
             acknowledge(state, acknowledgement)
             sendACK(state)

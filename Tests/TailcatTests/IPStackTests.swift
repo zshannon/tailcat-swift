@@ -647,7 +647,7 @@ final class IPStackTests: XCTestCase {
 
     /// A connection from A to a hand-driven peer that scales its window by 2^7.
     private func scriptedSender(_ log: PacketLog, sack: Bool = false) async throws -> (IPStack, TailcatConnection, UInt16, UInt32) {
-        let a = IPStack(address: addressA) { await log.record($0) }
+        let a = IPStack(address: addressA, selectiveAcknowledgments: sack) { await log.record($0) }
         let peer = addressB
         let connect = Task { try await a.connect(peer: peer, port: 80) }
         let syn = try await sent(log, count: 1)[0]
@@ -744,7 +744,7 @@ final class IPStackTests: XCTestCase {
         for peerSACK in [false, true] {
             // As the connector: our SYN offers it; ACKs report held data only if the SYN-ACK agreed.
             let log = PacketLog()
-            let a = IPStack(address: addressA) { await log.record($0) }
+            let a = IPStack(address: addressA, selectiveAcknowledgments: true) { await log.record($0) }
             let peer = addressB
             let connect = Task { try await a.connect(peer: peer, port: 80) }
             let syn = try await sent(log, count: 1)[0]
@@ -763,7 +763,7 @@ final class IPStackTests: XCTestCase {
 
             // As the listener: the SYN-ACK agrees only to a SYN that offered it.
             let serverLog = PacketLog()
-            let b = IPStack(address: addressA) { await serverLog.record($0) }
+            let b = IPStack(address: addressA, selectiveAcknowledgments: true) { await serverLog.record($0) }
             _ = try await b.listen(port: 80)
             await b.receive(segment(sequence: 100, ack: 0, flags: 0x02, window: 65_535,
                                     options: [2, 4, 0x04, 0xc4] + (peerSACK ? [1, 1, 4, 2] : [])))
@@ -774,9 +774,38 @@ final class IPStackTests: XCTestCase {
         }
     }
 
-    func testOutOfOrderDataIsReportedNewestBlockFirst() async throws {
+    func testSACKIsOfferedOnlyWhenConfigured() async throws {
+        // By default neither our SYN nor our SYN-ACK offers it, even to a peer that does.
         let log = PacketLog()
         let a = IPStack(address: addressA) { await log.record($0) }
+        let peer = addressB
+        let connect = Task { try await a.connect(peer: peer, port: 80) }
+        let syn = try await sent(log, count: 1)[0]
+        XCTAssertNil(option(syn, 4))
+        let local = UInt16(syn[40]) << 8 | UInt16(syn[41])
+        await a.receive(segment(ports: (80, local), sequence: 500, ack: sequenceNumber(syn) &+ 1, flags: 0x12,
+                                window: 65_535, options: [2, 4, 0x04, 0xc4, 1, 1, 4, 2]))
+        _ = try await deadline { try await connect.value }
+        await a.receive(segment(ports: (80, local), sequence: 1721, ack: sequenceNumber(syn) &+ 1, flags: 0x18,
+                                window: 65_535, payload: [UInt8](repeating: 1, count: 1220)))
+        let ack = try await sent(log, count: 3)[2]
+        XCTAssertEqual(acknowledgementNumber(ack), 501)
+        XCTAssertEqual(sackBlocks(ack), [])
+        await a.close()
+
+        let serverLog = PacketLog()
+        let b = IPStack(address: addressA) { await serverLog.record($0) }
+        _ = try await b.listen(port: 80)
+        await b.receive(segment(sequence: 100, ack: 0, flags: 0x02, window: 65_535, options: [2, 4, 0x04, 0xc4, 1, 1, 4, 2]))
+        let synACK = try await sent(serverLog, count: 1)[0]
+        XCTAssertEqual(synACK[53], 0x12)
+        XCTAssertNil(option(synACK, 4))
+        await b.close()
+    }
+
+    func testOutOfOrderDataIsReportedNewestBlockFirst() async throws {
+        let log = PacketLog()
+        let a = IPStack(address: addressA, selectiveAcknowledgments: true) { await log.record($0) }
         let peer = addressB
         let connect = Task { try await a.connect(peer: peer, port: 80) }
         let syn = try await sent(log, count: 1)[0]
@@ -845,8 +874,8 @@ final class IPStackTests: XCTestCase {
     func testDownloadWithThreeHolesInAWindowRecoversInAboutOneRoundTrip() async throws {
         // 100 ms round trips; three segments of one window lost on the way to A.
         let link = DelayLink(delay: 0.05, dropFromB: [32, 36, 40])
-        let a = IPStack(address: addressA) { await link.send($0, fromA: true) }
-        let b = IPStack(address: addressB) { await link.send($0, fromA: false) }
+        let a = IPStack(address: addressA, selectiveAcknowledgments: true) { await link.send($0, fromA: true) }
+        let b = IPStack(address: addressB, selectiveAcknowledgments: true) { await link.send($0, fromA: false) }
         await link.attach(a, b)
         let listener = try await b.listen(port: 80)
         let connector = Task { try await a.connect(peer: addressB, port: 80) }
