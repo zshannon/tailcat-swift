@@ -288,6 +288,9 @@ struct DirectDiscovery: Sendable {
 public actor NetworkTransport {
     public nonisolated let packets: AsyncThrowingStream<TransportPacket, Error>
     private let continuation: AsyncThrowingStream<TransportPacket, Error>.Continuation
+    private var dropped = 0
+    /// Received packets dropped because the engine fell `DERPTransport.receiveCapacity` behind.
+    public var receiveDrops: Int { get async { await relay.receiveDrops + dropped } }
     private let privateKey: Data
     private var nodePublicKey: Data?
     private let discoPrivateKey: Data
@@ -377,7 +380,7 @@ public actor NetworkTransport {
         self.startupTrace = startupTrace
         relay = DERPTransport(nodes: relayNodes, privateKey: privateKey, startupTrace: startupTrace)
         var output: AsyncThrowingStream<TransportPacket, Error>.Continuation!
-        packets = AsyncThrowingStream(bufferingPolicy: .bufferingNewest(256)) { output = $0 }
+        packets = AsyncThrowingStream(bufferingPolicy: .bufferingNewest(DERPTransport.receiveCapacity)) { output = $0 }
         continuation = output
     }
 
@@ -911,7 +914,14 @@ public actor NetworkTransport {
         } else {
             TransportDiagnostics.log("receive relay udp=\(udp?.port ?? 0) bytes=\(packet.payload.count) type=\(WireGuard.packetType(packet.payload) ?? 0)")
             if Self.carriesData(packet.payload) { peers[packet.source]?.lastActivity = Date() }
-            continuation.yield(TransportPacket(source: packet.source, payload: packet.payload, viaRelay: true))
+            deliver(TransportPacket(source: packet.source, payload: packet.payload, viaRelay: true))
+        }
+    }
+
+    private func deliver(_ packet: TransportPacket) {
+        if case .dropped = continuation.yield(packet) {
+            dropped += 1
+            TransportDiagnostics.log("receive queue full; dropped relay=\(packet.viaRelay) total=\(dropped)")
         }
     }
 
@@ -947,7 +957,7 @@ public actor NetworkTransport {
                 if carries { peers[key]?.lastActivity = now }
                 // An endpoint can be shared by configured identities. The WireGuard
                 // authentication layer determines which peer owns the datagram.
-                continuation.yield(TransportPacket(source: key, payload: packet, viaRelay: false))
+                deliver(TransportPacket(source: key, payload: packet, viaRelay: false))
                 delivered += 1
             }
             TransportDiagnostics.log("receive direct udp=\(udp?.port ?? 0) from=\(endpoint) bytes=\(packet.count) bindings=\(delivered)")

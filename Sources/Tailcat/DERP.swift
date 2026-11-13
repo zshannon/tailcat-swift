@@ -259,6 +259,12 @@ private final class DERPStream: @unchecked Sendable {
 public actor DERPTransport {
     public nonisolated let packets: AsyncThrowingStream<DERPPacket, Error>
     private let continuation: AsyncThrowingStream<DERPPacket, Error>.Continuation
+    /// Received packets wait here, and in `NetworkTransport.packets`, while the
+    /// engine decrypts the ones before them. A burst is at most what the peer
+    /// may have in flight: a full 1 MiB receive window is 860 segments.
+    static let receiveCapacity = 1024
+    /// Packets dropped because the reader fell `receiveCapacity` behind.
+    public private(set) var receiveDrops = 0
     /// Each time the connection is up again after one failed or was found
     /// silent by a check; not on the first connect. What went out the old
     /// connection meanwhile was lost, and is owed again.
@@ -318,7 +324,7 @@ public actor DERPTransport {
         self.startupTrace = startupTrace
         self.nodes = nodes.filter { !$0.stunOnly }; self.privateKey = privateKey
         var output: AsyncThrowingStream<DERPPacket, Error>.Continuation!
-        packets = AsyncThrowingStream(bufferingPolicy: .bufferingNewest(256)) { output = $0 }
+        packets = AsyncThrowingStream(bufferingPolicy: .bufferingNewest(Self.receiveCapacity)) { output = $0 }
         continuation = output
         (recoveries, recovered) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
     }
@@ -620,7 +626,9 @@ public actor DERPTransport {
                 switch frame.type {
                 case 5:
                     guard frame.payload.count >= 32, frame.payload.count <= 65568 else { throw TransportError.malformedPacket }
-                    continuation.yield(DERPPacket(source: Data(frame.payload.prefix(32)), payload: Data(frame.payload.dropFirst(32))))
+                    if case .dropped = continuation.yield(DERPPacket(source: Data(frame.payload.prefix(32)), payload: Data(frame.payload.dropFirst(32)))) {
+                        receiveDrops += 1
+                    }
                 case 6:
                     guard frame.payload.isEmpty else { throw TransportError.malformedPacket }
                 case 0x12:

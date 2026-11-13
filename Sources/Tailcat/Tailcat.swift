@@ -231,6 +231,9 @@ public actor TailcatClient {
     /// This client's TCP flows to the server, open and closing, against
     /// the budgets in `TailcatFlowStatistics`.
     public var flowStatistics: TailcatFlowStatistics { get async { await engine.flowStatistics() } }
+    /// Received packets dropped because they arrived faster than this client
+    /// could decrypt them, past a full receive window.
+    public var receiveDrops: Int { get async { await engine.receiveDrops() } }
 }
 
 private extension Task where Failure == Error {
@@ -462,6 +465,7 @@ internal actor TailcatEngine {
     }
     func ageDirectForTesting(by seconds: TimeInterval) async { await network.ageDirectForTesting(by: seconds) }
     #endif
+    func receiveDrops() async -> Int { await network.receiveDrops }
     func flowStatistics() async -> TailcatFlowStatistics {
         guard let stack else { return TailcatFlowStatistics(open: 0, closing: 0) }
         return await stack.flowStatistics

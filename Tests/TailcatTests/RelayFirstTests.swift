@@ -281,6 +281,39 @@ final class RelayFirstTests: XCTestCase {
         } catch { await a.close(); await b.close(); throw error }
     }
 
+    func testARelayBurstWaitsForTheEngineInsteadOfBeingDropped() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        let aKey = NaClBox.random(32), bKey = NaClBox.random(32)
+        let aDisco = NaClBox.random(32), bDisco = NaClBox.random(32)
+        let aPublic = try NaClBox.publicKey(for: aKey), bPublic = try NaClBox.publicKey(for: bKey)
+        // Relay only: no UDP socket opens.
+        let a = NetworkTransport(privateKey: aKey, discoPrivateKey: aDisco, relayNodes: [fixture.node], relayFirst: true, discovery: gatedDiscovery(DiscoveryGate()))
+        let b = NetworkTransport(privateKey: bKey, discoPrivateKey: bDisco, relayNodes: [fixture.node], relayFirst: true, discovery: gatedDiscovery(DiscoveryGate()))
+        do {
+            try await a.start(); try await b.start()
+            try await a.configurePeer(nodeKey: bPublic, discoKey: NaClBox.publicKey(for: bDisco))
+            try await b.configurePeer(nodeKey: aPublic, discoKey: NaClBox.publicKey(for: aDisco))
+            // A window of 800 full segments arrives while the engine is busy elsewhere.
+            let count = 800
+            for index in 0..<count {
+                try await a.send(to: bPublic, packet: Data([4, 0, 0, 0, UInt8(index >> 8), UInt8(truncatingIfNeeded: index)]) + Data(repeating: 0, count: 1194))
+            }
+            try await Task.sleep(nanoseconds: 300_000_000)
+            let received = try await within(5) { () -> [Int] in
+                var indexes = [Int]()
+                for try await packet in b.packets {
+                    indexes.append(Int(packet.payload[4]) << 8 | Int(packet.payload[5]))
+                    if indexes.count == count { break }
+                }
+                return indexes
+            }
+            XCTAssertEqual(received, Array(0..<count))
+            let drops = await b.receiveDrops
+            XCTAssertEqual(drops, 0)
+            await a.close(); await b.close()
+        } catch { await a.close(); await b.close(); throw error }
+    }
+
     func testBlockedSTUNDoesNotDelayEncryptedRelaySession() async throws {
         let fixture = try LocalRelay(); defer { fixture.close() }
         let gate = DiscoveryGate()
