@@ -732,7 +732,8 @@ public actor NetworkTransport {
         guard started, !closed else { return }
         scheduleDiscovery()
         for key in nodeKey.map({ [$0] }) ?? Array(peers.keys) {
-            scheduleProbe(key); scheduleInvitation(key)
+            // Forced, so that a probe sent less than a second ago delays this one rather than drops it.
+            scheduleProbe(key, force: true); scheduleInvitation(key)
         }
     }
 
@@ -1070,8 +1071,10 @@ public actor NetworkTransport {
             try keys.open(packet, privateKey: secret)
         }.value
         if sender == nil { TransportDiagnostics.log("disco open rejected endpoint=\(endpoint?.description ?? "relay")") }
-        guard let sender, !closed, !Task.isCancelled, networkGeneration == generation,
-              peers[key]?.generation == peerGeneration else { return }
+        guard let sender, !closed, !Task.isCancelled, networkGeneration == generation else { return }
+        // A relay reset marker handled while this was opened retires our probes and what answers
+        // them, not the peer's invitation: that lists where the peer is now.
+        if case .callMeMaybe = sender.message {} else if peers[key]?.generation != peerGeneration { return }
         switch sender.message {
         case let .ping(transaction, claimedKey):
             guard peers[key]?.directAllowed == true, claimedKey == nil || claimedKey == key else { return }
