@@ -605,7 +605,10 @@ public actor NetworkTransport {
         // won yet; its delayed Pong cannot restore the peer's abandoned socket.
         invalidateDirectPath(to: nodeKey)
         TransportDiagnostics.log("authenticated relay reset marker; fallback and revalidate")
-        scheduleProbe(nodeKey, force: true); scheduleInvitation(nodeKey)
+        // A probe just before the marker was cancelled with the route: one goes now, without
+        // waiting out the spacing, and one more after it in case this one is lost too.
+        peers[nodeKey]?.lastProbe = .distantPast
+        scheduleProbe(nodeKey, force: true); scheduleProbe(nodeKey, force: true); scheduleInvitation(nodeKey)
     }
 
     #if DEBUG
