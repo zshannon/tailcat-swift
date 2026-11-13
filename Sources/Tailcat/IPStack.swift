@@ -31,8 +31,6 @@ internal actor IPStack {
         let payload: Data
         var sent: TimeInterval
         var retries = 0
-        /// The peer reported holding it, out of order (RFC 2018).
-        var sacked = false
         var end: UInt32 {
             sequence &+ UInt32(payload.count) &+ ((flags & 0x03) != 0 ? 1 : 0)
         }
@@ -42,11 +40,6 @@ internal actor IPStack {
         let sequence: UInt32
         let payload: Data
         let fin: Bool
-    }
-
-    private struct SACKBlock: Equatable {
-        let left: UInt32
-        let right: UInt32
     }
 
     private final class TCPState {
@@ -95,18 +88,6 @@ internal actor IPStack {
         var receiveScale: UInt8 = 0
         /// Whether our SYN or SYN-ACK carries the window scale option.
         var offersScale = true
-        /// RFC 2018: both SYNs carried SACK-permitted, so ACKs report the
-        /// blocks held out of order, and loss recovery follows RFC 6675.
-        var sackPermitted = false
-        var offersSACK = true
-        /// Starts of the latest segments to arrive out of order, newest first:
-        /// the first SACK block holds the newest, the rest the ones reported last.
-        var sackArrivals: [UInt32] = []
-        /// RFC 6675 HighRxt: the end of the last segment retransmitted in this recovery.
-        var highRetransmit: UInt32 = 0
-        /// The recovery began with a retransmission timeout: every hole below
-        /// `recover` is taken as lost.
-        var timedOut = false
 
         init(key: FlowKey, phase: Phase, sequence: UInt32, listener: UUID? = nil) {
             self.key = key
@@ -175,14 +156,10 @@ internal actor IPStack {
     /// Bounds a flow's congestion window: at 215 full segments, four flows in
     /// flight still fit the 1024-packet output queue.
     private static let sendWindowLimit = 262_144
-    /// Whether SYNs offer SACK. Off by default: gVisor's RACK recovery, which a peer
-    /// that agrees to SACK uses, stops sending after a timeout that follows a lost flight.
-    private let selectiveAcknowledgments: Bool
 
-    internal init(address: Data, receiveCapacity: Int = 1 << 20, selectiveAcknowledgments: Bool = false,
+    internal init(address: Data, receiveCapacity: Int = 1 << 20,
                   send: @escaping @Sendable (Data) async throws -> Void) {
         self.address = address
-        self.selectiveAcknowledgments = selectiveAcknowledgments
         self.sendPacket = send
         self.receiveCapacity = receiveCapacity
         var shift: UInt8 = 0
@@ -199,7 +176,6 @@ internal actor IPStack {
         let local = try allocatePort(udp: false)
         let state = TCPState(key: FlowKey(peer: peer, localPort: local, remotePort: port),
                              phase: .synSent, sequence: UInt32.random(in: .min ... .max))
-        state.offersSACK = selectiveAcknowledgments
         connections[state.id] = state
         flows[state.key] = state.id
         let id = state.id
@@ -423,8 +399,6 @@ internal actor IPStack {
                     state.sendScale = shift
                     state.receiveScale = windowShift
                 } else { state.offersScale = false }
-                state.sackPermitted = selectiveAcknowledgments && Self.option(4, length: 2, body, headerLength: headerLength) != nil
-                state.offersSACK = state.sackPermitted
                 connections[state.id] = state
                 flows[key] = state.id
                 transmit(state, flags: 0x12)
@@ -449,7 +423,6 @@ internal actor IPStack {
                 state.sendScale = shift
                 state.receiveScale = windowShift
             }
-            state.sackPermitted = state.offersSACK && Self.option(4, length: 2, body, headerLength: headerLength) != nil
             state.phase = .established
             acknowledge(state, acknowledgement)
             sendACK(state)
@@ -500,19 +473,16 @@ internal actor IPStack {
             state.windowSequence = sequence
             state.windowAck = acknowledgement
         }
-        // With SACK, an ACK that reports newly held data is a duplicate even
-        // if the window moved, as the held data shrinks it (RFC 6675 section 2).
-        let newlySACKed = state.sackPermitted && updateScoreboard(state, body, headerLength: headerLength)
         if acknowledgement == state.sendUnacknowledged && payload.isEmpty && flags & 1 == 0 &&
-            (state.sackPermitted ? newlySACKed : oldWindow == state.remoteWindow) && !state.segments.isEmpty {
+            oldWindow == state.remoteWindow && !state.segments.isEmpty {
             state.duplicateACKs += 1
-            if state.duplicateACKs == 3, state.recover == nil, !state.segments.isEmpty { fastRetransmit(state) }
+            if state.duplicateACKs == 3, state.recover == nil, !state.segments.isEmpty {
+                enterRecovery(state)
+                state.congestionWindow = state.slowStartThreshold
+                resend(state)
+            }
         } else if Self.before(state.sendUnacknowledged, acknowledgement) {
             acknowledge(state, acknowledgement)
-        }
-        // Three segments held above the first unacknowledged one: it is lost (RFC 6675 section 5).
-        if state.sackPermitted, state.recover == nil, !state.segments.isEmpty, scoreboard(state).lost[0] {
-            fastRetransmit(state)
         }
         if !payload.isEmpty || flags & 1 != 0 {
             // Data is acknowledged at once: a writer waits for its bytes to be
@@ -572,7 +542,7 @@ internal actor IPStack {
         return min(14, body[offset + 2])
     }
 
-    private static func option(_ wanted: UInt8, length wantedLength: Int?, _ body: [UInt8], headerLength: Int) -> Int? {
+    private static func option(_ wanted: UInt8, length wantedLength: Int, _ body: [UInt8], headerLength: Int) -> Int? {
         var offset = 20
         while offset < headerLength {
             let kind = body[offset]
@@ -581,7 +551,7 @@ internal actor IPStack {
             guard offset + 1 < headerLength else { break }
             let length = Int(body[offset + 1])
             guard length >= 2, offset + length <= headerLength else { break }
-            if kind == wanted && (wantedLength == nil || length == wantedLength) { return offset }
+            if kind == wanted && length == wantedLength { return offset }
             offset += length
         }
         return nil
@@ -614,11 +584,6 @@ internal actor IPStack {
         state.duplicateACKs = 0
         state.retransmitDelay = 0.5
         state.segments.removeAll { !Self.before(ack, $0.end) }
-        // RFC 6298 (5.3): new data acknowledged restarts the timer. Without SACK
-        // each partial ACK retransmits, which restarts it.
-        if state.sackPermitted, state.recover != nil, advanced > 0, !state.segments.isEmpty {
-            state.segments[0].sent = ProcessInfo.processInfo.systemUptime
-        }
         if let first = state.segments.first, Self.before(first.sequence, ack), !first.payload.isEmpty {
             let count = Int(ack &- first.sequence)
             if count < first.payload.count {
@@ -627,11 +592,10 @@ internal actor IPStack {
             }
         }
         if let recover = state.recover {
-            if Self.before(ack, recover) { if !state.sackPermitted && !state.segments.isEmpty { resend(state) } }
-            else { state.recover = nil; state.timedOut = false }
+            if Self.before(ack, recover) { if !state.segments.isEmpty { resend(state) } }
+            else { state.recover = nil }
         }
-        // RFC 6675 holds the congestion window through fast recovery; the pipe paces it.
-        if advanced > 0 && !(state.sackPermitted && state.recover != nil && !state.timedOut) {
+        if advanced > 0 {
             // A delayed ACK covers two segments (RFC 3465, L = 2).
             let increment = state.congestionWindow < state.slowStartThreshold ? min(advanced, 2 * state.mss) :
                 max(1, state.mss * min(advanced, state.mss) / max(1, state.congestionWindow))
@@ -686,10 +650,6 @@ internal actor IPStack {
             state.receiveNext &+= UInt32(data.count)
             if acceptedFIN { state.readEOF = true; state.receiveNext &+= 1 }
         } else if !data.isEmpty || acceptedFIN {
-            if !data.isEmpty {
-                state.sackArrivals.removeAll { $0 == seq }
-                state.sackArrivals = Array(([seq] + state.sackArrivals).prefix(8))
-            }
             // Enough segments for a whole window lost behind one hole.
             if !state.incoming.contains(where: { $0.sequence == seq && $0.payload.count >= data.count }) && state.incoming.count < 1024 {
                 let index = state.incoming.firstIndex { Self.before(seq, $0.sequence) } ?? state.incoming.endIndex
@@ -737,8 +697,7 @@ internal actor IPStack {
         let syn = segment.flags & 0x02 != 0
         emit(tcpPacket(state.key, sequence: segment.sequence, ack: state.receiveNext,
                        flags: segment.flags, window: advertise(state, syn: syn), payload: segment.payload,
-                       windowScale: syn && state.offersScale ? windowShift : nil,
-                       sackPermitted: syn && state.offersSACK))
+                       windowScale: syn && state.offersScale ? windowShift : nil))
     }
 
     /// Halves the flight, not the congestion window, which an earlier timeout
@@ -748,106 +707,15 @@ internal actor IPStack {
         state.recover = state.sendNext
     }
 
-    /// Three duplicate ACKs, or SACK blocks showing the first segment lost.
-    private func fastRetransmit(_ state: TCPState) {
-        enterRecovery(state)
-        state.congestionWindow = state.slowStartThreshold
-        state.timedOut = false
-        resend(state)
-    }
-
     /// Retransmits the first unacknowledged segment, restarting its timer.
     private func resend(_ state: TCPState) {
         state.segments[0].sent = ProcessInfo.processInfo.systemUptime
-        state.highRetransmit = state.segments[0].end
         retransmit(state, state.segments[0])
-    }
-
-    /// Marks the segments the peer's SACK blocks report held. Blocks outside
-    /// the unacknowledged data are ignored (RFC 2018 section 5). True if any are new.
-    private func updateScoreboard(_ state: TCPState, _ body: [UInt8], headerLength: Int) -> Bool {
-        guard let offset = Self.option(5, length: nil, body, headerLength: headerLength) else { return false }
-        let length = Int(body[offset + 1])
-        guard (length - 2) % 8 == 0 else { return false }
-        var newly = false
-        for block in 0..<(length - 2) / 8 {
-            let left = Self.u32(body, offset + 2 + 8 * block), right = Self.u32(body, offset + 6 + 8 * block)
-            guard Self.before(left, right), !Self.before(left, state.sendUnacknowledged),
-                  !Self.before(state.sendNext, right) else { continue }
-            for index in state.segments.indices where !state.segments[index].sacked &&
-                !Self.before(state.segments[index].sequence, left) && !Self.before(right, state.segments[index].end) {
-                state.segments[index].sacked = true
-                newly = true
-            }
-        }
-        return newly
-    }
-
-    /// RFC 6675 IsLost for each outstanding segment: three segments, or more
-    /// than two segments' bytes, held above it, or a hole left by a timeout.
-    /// And SetPipe: the bytes believed still in the network.
-    private func scoreboard(_ state: TCPState) -> (lost: [Bool], pipe: Int) {
-        var lost = [Bool](repeating: false, count: state.segments.count)
-        var pipe = 0, sackedBytes = 0, sackedSegments = 0
-        for index in state.segments.indices.reversed() {
-            let segment = state.segments[index]
-            let size = Int(segment.end &- segment.sequence)
-            if segment.sacked { sackedBytes += size; sackedSegments += 1; continue }
-            lost[index] = sackedSegments >= 3 || sackedBytes > 2 * state.mss ||
-                (state.timedOut && state.recover.map { Self.before(segment.sequence, $0) } == true)
-            if !lost[index] { pipe += size }
-            if Self.before(segment.sequence, state.highRetransmit) { pipe += size }
-        }
-        return (lost, pipe)
-    }
-
-    /// RFC 6675 NextSeg rules 1 and 3, while the pipe leaves a segment of the
-    /// congestion window: the holes taken as lost, then, with no new data to
-    /// send, the others below the highest SACKed byte. Returns the pipe after them.
-    private func retransmitHoles(_ state: TCPState) -> Int {
-        var (lost, pipe) = scoreboard(state)
-        let unsent = state.writes.contains { $0.offset < $0.data.count }
-        let highSACK = state.segments.last(where: \.sacked)?.end
-        for anyHole in [false, true] where !anyHole || !unsent {
-            for index in state.segments.indices where state.congestionWindow - pipe >= state.mss {
-                let segment = state.segments[index]
-                guard !segment.sacked, !Self.before(segment.sequence, state.highRetransmit) else { continue }
-                if anyHole {
-                    guard let highSACK, Self.before(segment.sequence, highSACK) else { break }
-                } else if !lost[index] { continue }
-                state.segments[index].sent = ProcessInfo.processInfo.systemUptime
-                state.highRetransmit = segment.end
-                retransmit(state, segment)
-                pipe += Int(segment.end &- segment.sequence)
-                lost[index] = false
-            }
-        }
-        return pipe
     }
 
     private func sendACK(_ state: TCPState) {
         emit(tcpPacket(state.key, sequence: state.sendNext, ack: state.receiveNext,
-                       flags: 0x10, window: advertise(state), sack: sackBlocks(state)))
-    }
-
-    /// Up to four blocks of data held above a hole, as RFC 2018 section 4 orders
-    /// them: first the one holding the newest segment, then the most recently reported.
-    private func sackBlocks(_ state: TCPState) -> [SACKBlock] {
-        guard state.sackPermitted, !state.incoming.isEmpty else { return [] }
-        var ranges: [SACKBlock] = []
-        for item in state.incoming where !item.payload.isEmpty {
-            let end = item.sequence &+ UInt32(item.payload.count)
-            if let last = ranges.last, !Self.before(last.right, item.sequence) {
-                if Self.before(last.right, end) { ranges[ranges.count - 1] = SACKBlock(left: last.left, right: end) }
-            } else { ranges.append(SACKBlock(left: item.sequence, right: end)) }
-        }
-        var blocks: [SACKBlock] = []
-        for sequence in state.sackArrivals {
-            if let range = ranges.first(where: { !Self.before(sequence, $0.left) && Self.before(sequence, $0.right) }),
-               !blocks.contains(range) { blocks.append(range) }
-        }
-        for range in ranges.reversed() where !blocks.contains(range) { blocks.append(range) }
-        return Array(blocks.prefix(4))
+                       flags: 0x10, window: advertise(state)))
     }
 
     /// The window field for a segment carrying RCV.NXT, recording the edge it promises.
@@ -859,12 +727,10 @@ internal actor IPStack {
 
     private func flush(_ state: TCPState) {
         guard state.phase == .established else { return }
-        // In SACK recovery the pipe, not the flight, is held to the congestion window.
-        var pipe = state.sackPermitted && state.recover != nil && !state.segments.isEmpty ? retransmitHoles(state) : nil
         for index in state.writes.indices {
             while state.writes[index].offset < state.writes[index].data.count {
                 let inFlight = Int(state.sendNext &- state.sendUnacknowledged)
-                let allowed = min(Int(state.remoteWindow) - inFlight, state.congestionWindow - (pipe ?? inFlight))
+                let allowed = min(Int(state.remoteWindow), state.congestionWindow) - inFlight
                 guard allowed > 0 else { return }
                 let offset = state.writes[index].offset
                 let remaining = state.writes[index].data.count - offset
@@ -875,7 +741,6 @@ internal actor IPStack {
                 let bytes = state.writes[index].data.subdata(in: offset..<(offset + count))
                 state.writes[index].offset += count
                 transmit(state, flags: 0x18, payload: bytes)
-                pipe? += count
             }
             if state.writes[index].end == nil { state.writes[index].end = state.sendNext }
         }
@@ -1119,11 +984,6 @@ internal actor IPStack {
                 state.congestionWindow = state.mss
                 state.retransmitDelay = min(8, state.retransmitDelay * 2)
                 state.segments[0].retries += 1
-                if state.sackPermitted {
-                    state.timedOut = true
-                    // The peer dropped data it had reported holding: forget every report.
-                    if state.segments[0].sacked { for index in state.segments.indices { state.segments[index].sacked = false } }
-                }
                 resend(state)
             }
             if state.remoteWindow == 0 && (!state.writes.isEmpty || state.writeClosed) && now - state.persistSent >= 1 {
@@ -1146,11 +1006,8 @@ internal actor IPStack {
     }
 
     private func tcpPacket(_ key: FlowKey, sequence: UInt32, ack: UInt32, flags: UInt8,
-                           window: UInt16, payload: Data = Data(), windowScale: UInt8? = nil,
-                           sackPermitted: Bool = false, sack: [SACKBlock] = []) -> Data {
-        let optionLength = (flags & 0x02 != 0 ? 4 : 0) + (windowScale == nil ? 0 : 4) + (sackPermitted ? 4 : 0) +
-            (sack.isEmpty ? 0 : 4 + 8 * sack.count)
-        var body = [UInt8](repeating: 0, count: 20 + optionLength)
+                           window: UInt16, payload: Data = Data(), windowScale: UInt8? = nil) -> Data {
+        var body = [UInt8](repeating: 0, count: flags & 0x02 != 0 ? (windowScale == nil ? 24 : 28) : 20)
         Self.put16(&body, 0, key.localPort)
         Self.put16(&body, 2, key.remotePort)
         Self.put32(&body, 4, sequence)
@@ -1158,17 +1015,8 @@ internal actor IPStack {
         body[12] = UInt8(body.count / 4) << 4
         body[13] = flags
         Self.put16(&body, 14, window)
-        var offset = 20
-        if flags & 0x02 != 0 { body[20] = 2; body[21] = 4; Self.put16(&body, 22, 1220); offset = 24 }
-        if let windowScale { body[offset] = 1; body[offset + 1] = 3; body[offset + 2] = 3; body[offset + 3] = windowScale; offset += 4 }
-        if sackPermitted { body[offset] = 1; body[offset + 1] = 1; body[offset + 2] = 4; body[offset + 3] = 2; offset += 4 }
-        if !sack.isEmpty {
-            body[offset] = 1; body[offset + 1] = 1; body[offset + 2] = 5; body[offset + 3] = UInt8(2 + 8 * sack.count)
-            for (index, block) in sack.enumerated() {
-                Self.put32(&body, offset + 4 + 8 * index, block.left)
-                Self.put32(&body, offset + 8 + 8 * index, block.right)
-            }
-        }
+        if flags & 0x02 != 0 { body[20] = 2; body[21] = 4; Self.put16(&body, 22, 1220) }
+        if let windowScale { body[24] = 1; body[25] = 3; body[26] = 3; body[27] = windowScale }
         body.append(contentsOf: payload)
         Self.put16(&body, 16, Self.checksum(source: address, destination: key.peer, proto: 6, body: body))
         return ipv6(peer: key.peer, proto: 6, body: body)

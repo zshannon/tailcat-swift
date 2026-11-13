@@ -10,8 +10,6 @@ public actor TailcatServer {
         public var disablePresharedKey = false
         /// Start over DERP without waiting for UDP setup; discover direct paths in the background.
         public var relayFirst = false
-        /// Offer TCP selective acknowledgments (RFC 2018) on tunnelled connections.
-        public var selectiveAcknowledgments = false
         var directDiscovery = DirectDiscovery()
         public var region: DERPRegion?
         public var regionID = -1
@@ -135,9 +133,6 @@ public actor TailcatClient {
         public var connectTimeout: TimeInterval = 30
         /// Start over DERP without waiting for UDP setup; discover direct paths in the background.
         public var relayFirst = false
-        /// Offer TCP selective acknowledgments (RFC 2018). Off by default: the Go server's
-        /// gVisor stack, once a client agrees to them, recovers from a timeout only slowly.
-        public var selectiveAcknowledgments = false
         var directDiscovery = DirectDiscovery()
         package var startupTrace: StartupTrace?
         public init() {}
@@ -196,7 +191,6 @@ public actor TailcatClient {
         let trace = configuration.startupTrace
         var transportConfiguration = TailcatServer.Configuration()
         transportConfiguration.relayFirst = configuration.relayFirst
-        transportConfiguration.selectiveAcknowledgments = configuration.selectiveAcknowledgments
         transportConfiguration.directDiscovery = configuration.directDiscovery
         let engine = try TailcatEngine(key: key, address: expanded, server: false, configuration: transportConfiguration, startupTrace: trace)
         do {
@@ -347,7 +341,7 @@ internal actor TailcatEngine {
         await network.setRelayMarkerProvider { [weak self] node in
             try await self?.makeRelayResetMarker(to: node)
         }
-        stack = IPStack(address: publicKey.address, selectiveAcknowledgments: configuration.selectiveAcknowledgments) { [weak self] packet in
+        stack = IPStack(address: publicKey.address) { [weak self] packet in
             guard let self else { throw TailcatError.closed }; try await self.sendIP(packet)
         }
         if !server {
@@ -736,7 +730,7 @@ internal actor TailcatEngine {
             if let existing = targets[destination] { target = existing }
             else {
                 guard targets.count < 128 else { return }
-                target = IPStack(address: destination, selectiveAcknowledgments: configuration.selectiveAcknowledgments) { [weak self] packet in
+                target = IPStack(address: destination) { [weak self] packet in
                     guard let self else { throw TailcatError.closed }; try await self.sendIP(packet)
                 }
                 targets[destination] = target
