@@ -839,9 +839,10 @@ public actor NetworkTransport {
         if let peer = peers[nodeKey], peer.direct != nil, Date().timeIntervalSince(peer.verified) >= Self.directLifetime {
             invalidateDirectPath(to: nodeKey)
             requestRelayMarker(to: nodeKey)
-            // The probes it cancelled were what would renew the route: one goes again now.
+            // The probes it cancelled were what would renew the route: one goes again now,
+            // and one more after the spacing in case it is lost as well.
             peers[nodeKey]?.lastProbe = .distantPast
-            scheduleProbe(nodeKey, force: true)
+            scheduleProbe(nodeKey, force: true); scheduleProbe(nodeKey, force: true)
         }
         try await sendPendingRelayMarker(to: nodeKey)
         TransportDiagnostics.log("send relay udp=\(udp?.port ?? 0) bytes=\(packet.count) type=\(WireGuard.packetType(packet) ?? 0)")
