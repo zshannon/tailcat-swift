@@ -91,6 +91,11 @@ public actor TailcatServer {
         await engine?.peerKey(address: connection.remoteAddress)
     }
     public func peerKey(remoteAddress: Data) async -> NodePublicKey? { await engine?.peerKey(address: remoteAddress) }
+    #if DEBUG
+    func inviteForTesting(_ node: NodePublicKey, discoKey: Data) async throws {
+        guard let engine else { throw TailcatError.notStarted }; try await engine.inviteForTesting(node, discoKey: discoKey)
+    }
+    #endif
     public func path(to key: NodePublicKey) async throws -> ConnectionPath {
         guard let engine else { throw TailcatError.notStarted }; return await engine.path(to: key)
     }
@@ -280,6 +285,7 @@ internal actor TailcatEngine {
     private var admitting: [Data: (UUID, Task<Void, Never>)] = [:]
     private var reader: Task<Void, Never>?
     private var recoveries: Task<Void, Never>?
+    private var restarts: Task<Void, Never>?
     private var timer: Task<Void, Never>?
     private var connectionWaiter: (id: UUID, continuation: CheckedContinuation<Void, Error>)?
     private var connectionDeadline: Task<Void, Never>?
@@ -355,6 +361,9 @@ internal actor TailcatEngine {
         }
         recoveries = Task { [weak self, network] in
             for await _ in network.relayRecoveries { await self?.relayRecovered() }
+        }
+        restarts = Task { [weak self, network] in
+            for await node in network.restartedPeers { await self?.peerRestarted(node) }
         }
         timer = Task { [weak self] in
             var delay: TimeInterval = 1
@@ -477,6 +486,21 @@ internal actor TailcatEngine {
     }
     func resetNetwork() async { await network.resetNetwork() }
     private func relayRecovered() async { await stack?.resendOwed() }
+    /// A server back on new ports holds neither our session nor our admission: nothing sent
+    /// on the old session can be answered, so rejoin now rather than wait for its silence.
+    private func peerRestarted(_ node: Data) async {
+        guard !server, node == address.serverPublicKey.rawValue else { return }
+        rejoin()
+        await tick()
+    }
+    /// Meow and handshake again at the next tick; the session stays in use until replaced.
+    private func rejoin() {
+        let node = address.serverPublicKey.rawValue
+        guard var peer = peers[node], peer.acknowledged else { return }
+        peer.acknowledged = false; peer.rejoining = true; peer.lastMeow = .distantPast
+        peer.sentSinceReceived = nil; owedSince = nil
+        peers[node] = peer
+    }
     #if DEBUG
     /// As if suspended for `seconds`: sessions and activity are that much older.
     func ageForTesting(by seconds: TimeInterval) {
@@ -498,6 +522,12 @@ internal actor TailcatEngine {
         ageUnansweredForTesting(by: seconds)
         _ = await tickAndDelay(overslept: seconds)
     }
+    /// Advertise our endpoints to `node` before it has been admitted, as the Go server
+    /// does to the clients it knows.
+    func inviteForTesting(_ node: NodePublicKey, discoKey: Data) async throws {
+        try await network.configurePeer(nodeKey: node.rawValue, discoKey: discoKey)
+        await network.allowDirect(to: node.rawValue)
+    }
     #endif
     func receiveDrops() async -> Int { await network.receiveDrops }
     func flowStatistics() async -> TailcatFlowStatistics {
@@ -515,7 +545,7 @@ internal actor TailcatEngine {
     func close() async {
         guard !closed else { return }; closed = true
         finishConnection(.failure(TailcatError.closed))
-        reader?.cancel(); recoveries?.cancel(); timer?.cancel(); selectedTCPHandlers.removeAll()
+        reader?.cancel(); recoveries?.cancel(); restarts?.cancel(); timer?.cancel(); selectedTCPHandlers.removeAll()
         for (_, task) in admitting.values { task.cancel() }; admitting.removeAll()
         for task in handlerTasks.values { task.cancel() }; handlerTasks.removeAll()
         for listener in handlerUDP.values { await listener.close() }; handlerUDP.removeAll(); handlerTCP.removeAll()
@@ -815,12 +845,10 @@ internal actor TailcatEngine {
         if !server {
             if await stack?.retransmitting == true { owedSince = owedSince ?? now } else { owedSince = nil }
         }
-        if !server, var peer = peers[address.serverPublicKey.rawValue], peer.acknowledged,
+        if !server, let peer = peers[address.serverPublicKey.rawValue],
            peer.sentSinceReceived.map({ now.timeIntervalSince($0) >= 15 }) == true
             || owedSince.map({ now.timeIntervalSince($0) >= 5 }) == true {
-            peer.acknowledged = false; peer.rejoining = true; peer.lastMeow = .distantPast
-            peer.sentSinceReceived = nil; owedSince = nil
-            peers[address.serverPublicKey.rawValue] = peer
+            rejoin()
         }
         if !server, peers[address.serverPublicKey.rawValue]?.acknowledged == false {
             var peer = peers[address.serverPublicKey.rawValue]!

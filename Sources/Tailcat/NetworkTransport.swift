@@ -363,6 +363,10 @@ public actor NetworkTransport {
     private let relay: DERPTransport
     /// The relay connection up again after a failure (`DERPTransport.recoveries`).
     nonisolated var relayRecoveries: AsyncStream<Void> { relay.recoveries }
+    /// Peers whose authenticated invitation moved every advertised port: a new socket, as
+    /// when the peer restarted, and so none of the sessions it had.
+    nonisolated let restartedPeers: AsyncStream<Data>
+    private let restartedPeer: AsyncStream<Data>.Continuation
     private let relayNodes: [DERPNode]
     private let relayFirst: Bool
     private let discovery: DirectDiscovery
@@ -447,6 +451,7 @@ public actor NetworkTransport {
         var output: AsyncThrowingStream<TransportPacket, Error>.Continuation!
         packets = AsyncThrowingStream(bufferingPolicy: .bufferingNewest(DERPTransport.receiveCapacity)) { output = $0 }
         continuation = output
+        (restartedPeers, restartedPeer) = AsyncStream.makeStream(of: Data.self, bufferingPolicy: .bufferingNewest(8))
     }
 
     public func start() async throws {
@@ -1142,6 +1147,10 @@ public actor NetworkTransport {
                     TransportDiagnostics.log("remote route replaced; fallback relay old=\(selected)")
                 }
                 peers[key]?.invitedEndpoints = invited
+                if !previous.isEmpty, Set(previous.map(\.port)).isDisjoint(with: invited.map(\.port)) {
+                    TransportDiagnostics.log("remote ports replaced; peer restarted")
+                    restartedPeer.yield(key)
+                }
             }
             TransportDiagnostics.log("invite udp=\(udp?.port ?? 0) endpoints=\(endpoints.map(\.description))")
             for address in endpoints.prefix(128) where address.port != 0 {

@@ -428,6 +428,44 @@ final class RelayFirstTests: XCTestCase {
         } catch { await gate.release(); await pair.client.close(); await pair.server.close(); throw error }
     }
 
+    func testAServerBackOnNewPortsIsRejoinedAtOnce() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        var serverConfig = TailcatServer.Configuration()
+        serverConfig.relayFirst = true
+        serverConfig.region = DERPRegion(regionID: 1, nodes: [fixture.node])
+        serverConfig.directDiscovery = loopbackDiscovery()
+        serverConfig.privateKey = try NodePrivateKey.generate()
+        serverConfig.presharedKey = try PresharedKey.generate()
+        let first = TailcatServer(configuration: serverConfig), second = TailcatServer(configuration: serverConfig)
+        let firstListener = try await first.listen(port: 8104)
+        var config = TailcatClient.Configuration()
+        config.relayFirst = true; config.directDiscovery = loopbackDiscovery()
+        let client = try await TailcatClient.connect(to: first.address, configuration: config)
+        do {
+            let stream = try await client.openTCP(port: 8104)
+            try await exchange(stream, try await firstListener.accept(), "before the restart")
+            try await eventually { if case .direct = await client.path { return true }; return false }
+            // The computer restarts with the same key, on a new UDP port, while the phone is away.
+            await first.close()
+            let listener = try await second.listen(port: 8104)
+            let opening = Task { try await client.openTCP(port: 8104) }
+            try await Task.sleep(nanoseconds: 300_000_000)
+            await client.resumeForTesting(after: 20)
+            let started = Date()
+            await client.wake()
+            // As the Go server does for the clients it knows, the new process advertises its
+            // new ports at once: the client learns of the restart before anything goes unanswered.
+            try await second.inviteForTesting(await client.publicKey, discoKey: try await client.discoveryPublicKey)
+            let accepted = try await within(5) { try await listener.accept() }
+            let fresh = try await within(5) { try await opening.value }
+            try await exchange(fresh, accepted, "after the restart")
+            let elapsed = Date().timeIntervalSince(started)
+            print("RESTART-REJOIN \(Int(elapsed * 1000))ms")
+            XCTAssertLessThan(elapsed, 1)
+            await client.close(); await second.close()
+        } catch { await client.close(); await second.close(); throw error }
+    }
+
     func testBlockedSTUNDoesNotDelayEncryptedRelaySession() async throws {
         let fixture = try LocalRelay(); defer { fixture.close() }
         let gate = DiscoveryGate()
