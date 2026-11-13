@@ -34,6 +34,17 @@ private final class DiscoveryPacketFilter: @unchecked Sendable {
     }
 }
 
+/// The first receiver index it is asked about, and only that one, matches.
+private final class FirstReceiver: @unchecked Sendable {
+    private let lock = NSLock()
+    private var index: Data?
+    func matches(_ receiver: Data) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if index == nil { index = receiver }
+        return index == receiver
+    }
+}
+
 final class RelayFirstTests: XCTestCase {
     private func within<T: Sendable>(_ seconds: Double = 10, _ operation: @escaping @Sendable () async throws -> T) async throws -> T {
         try await withThrowingTaskGroup(of: T.self) { group in
@@ -364,6 +375,55 @@ final class RelayFirstTests: XCTestCase {
             try await exchange(pair.stream, pair.accepted, "after rejoining")
             // The initiation that went with the meow, and its replay once meowed, which the server drops.
             XCTAssertEqual(fixture.relayedInitiations, initiations + 2)
+            await gate.release(); await pair.client.close(); await pair.server.close()
+        } catch { await gate.release(); await pair.client.close(); await pair.server.close(); throw error }
+    }
+
+    func testATickThatFollowsASuspensionDoesNotRejoin() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        let gate = DiscoveryGate()
+        let pair = try await wakePair(fixture, port: 8102, client: gatedDiscovery(gate))
+        do {
+            try await exchange(pair.stream, pair.accepted, "before")
+            let client = await pair.client.publicKey.rawValue
+            fixture.drop(.max) { source, packet in source == client && packet.first == 4 }
+            let writer = Task { try await pair.stream.write(Data("sent just before suspending".utf8)) }
+            defer { writer.cancel() }
+            try await Task.sleep(nanoseconds: 300_000_000)
+            let initiations = fixture.relayedInitiations
+            // The timer's first tick after twenty suspended seconds, before the app's wake:
+            // nothing could have answered meanwhile, so nothing is unanswered yet.
+            await pair.client.resumeForTesting(after: 20)
+            try await Task.sleep(nanoseconds: 1_500_000_000)
+            XCTAssertEqual(fixture.relayedInitiations, initiations)
+            fixture.stopDropping()
+            await gate.release(); await pair.client.close(); await pair.server.close()
+        } catch { fixture.stopDropping(); await gate.release(); await pair.client.close(); await pair.server.close(); throw error }
+    }
+
+    func testDataOwedForFiveSecondsRejoinsWhileTheServerStillSends() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        let gate = DiscoveryGate()
+        let pair = try await wakePair(fixture, port: 8100, client: gatedDiscovery(gate))
+        do {
+            try await exchange(pair.stream, pair.accepted, "before")
+            // The server can no longer read the session the client sends on, as after a
+            // handshake that crossed one of its own, yet what it sends still arrives.
+            let client = await pair.client.publicKey.rawValue, lost = FirstReceiver()
+            fixture.drop(.max) { source, packet in
+                source == client && packet.first == 4 && packet.count >= 8 && lost.matches(Data(packet[4..<8]))
+            }
+            let writer = Task {
+                for _ in 0..<40 { try await pair.accepted.write(Data("x".utf8)); try await Task.sleep(nanoseconds: 500_000_000) }
+            }
+            defer { writer.cancel() }
+            let started = Date()
+            // Unanswered for five seconds: a new handshake, rather than fifteen seconds
+            // with nothing back, which the server's own packets keep from coming.
+            let fresh = try await within(10) { try await pair.client.openTCP(port: 8100) }
+            print("OWED-REJOIN \(Int(Date().timeIntervalSince(started) * 1000))ms")
+            XCTAssertLessThan(Date().timeIntervalSince(started), 8)
+            await fresh.close()
             await gate.release(); await pair.client.close(); await pair.server.close()
         } catch { await gate.release(); await pair.client.close(); await pair.server.close(); throw error }
     }

@@ -234,6 +234,7 @@ public actor TailcatClient {
     func ageForTesting(by seconds: TimeInterval) async { await engine.ageForTesting(by: seconds) }
     func ageDirectForTesting(by seconds: TimeInterval) async { await engine.ageDirectForTesting(by: seconds) }
     func ageUnansweredForTesting(by seconds: TimeInterval) async { await engine.ageUnansweredForTesting(by: seconds) }
+    func resumeForTesting(after seconds: TimeInterval) async { await engine.resumeForTesting(after: seconds) }
     #endif
     /// This client's TCP flows to the server, open and closing, against
     /// the budgets in `TailcatFlowStatistics`.
@@ -283,6 +284,8 @@ internal actor TailcatEngine {
     private var connectionWaiter: (id: UUID, continuation: CheckedContinuation<Void, Error>)?
     private var connectionDeadline: Task<Void, Never>?
     private var closed = false
+    /// When a tick first found a flow retransmitting, unanswered since.
+    private var owedSince: Date?
     private var explicitTCPPorts: Set<UInt16> = []
     private var explicitUDPPorts: Set<UInt16> = []
     private var targets: [Data: IPStack] = [:]
@@ -356,15 +359,18 @@ internal actor TailcatEngine {
         timer = Task { [weak self] in
             var delay: TimeInterval = 1
             while !Task.isCancelled {
+                let slept = Date()
                 do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { break }
-                guard let next = await self?.tickAndDelay() else { break }
+                guard let next = await self?.tickAndDelay(overslept: Date().timeIntervalSince(slept) - delay) else { break }
                 delay = next
             }
         }
     }
     /// One tick, then how long until the next: every second while anything
     /// is connecting or moving data, else until the next idle mark.
-    private func tickAndDelay() async -> TimeInterval {
+    private func tickAndDelay(overslept: TimeInterval) async -> TimeInterval {
+        // Suspended: this tick may come before the wake, and nothing could have answered.
+        if overslept >= 5 { forgetUnanswered() }
         await tick()
         guard !server, !closed else { return 1 }
         let now = Date()
@@ -461,9 +467,13 @@ internal actor TailcatEngine {
         for node in Array(peers.keys) where peers[node]?.wireguard.isUsable() == false {
             peers[node]?.rekeyNow = true; peers[node]?.lastHandshake = .distantPast
         }
-        // An answer due while suspended had no chance to come.
-        for node in Array(peers.keys) { peers[node]?.sentSinceReceived = nil }
+        forgetUnanswered()
         await tick()
+    }
+    /// An answer due while suspended had no chance to come.
+    private func forgetUnanswered() {
+        for node in Array(peers.keys) { peers[node]?.sentSinceReceived = nil }
+        owedSince = nil
     }
     func resetNetwork() async { await network.resetNetwork() }
     private func relayRecovered() async { await stack?.resendOwed() }
@@ -482,6 +492,11 @@ internal actor TailcatEngine {
     /// As if what was sent had gone unanswered for `seconds` longer.
     func ageUnansweredForTesting(by seconds: TimeInterval) {
         for node in Array(peers.keys) { peers[node]?.sentSinceReceived? -= seconds }
+    }
+    /// The timer's first tick after a suspension of `seconds`.
+    func resumeForTesting(after seconds: TimeInterval) async {
+        ageUnansweredForTesting(by: seconds)
+        _ = await tickAndDelay(overslept: seconds)
     }
     #endif
     func receiveDrops() async -> Int { await network.receiveDrops }
@@ -794,11 +809,17 @@ internal actor TailcatEngine {
         // As in WireGuard, data with nothing authenticated back for its keepalive and rekey
         // timeouts, 15 s, starts a new handshake. A server restarted with the same key holds
         // neither our session nor our admission, so the handshake goes with a meow, as when
-        // connecting. The session stays in use until the new one replaces it.
+        // connecting. The session stays in use until the new one replaces it. Packets from
+        // the server don't show that it reads ours, so a flow whose data has gone
+        // unacknowledged for 5 s handshakes again too; an idle one never does.
+        if !server {
+            if await stack?.retransmitting == true { owedSince = owedSince ?? now } else { owedSince = nil }
+        }
         if !server, var peer = peers[address.serverPublicKey.rawValue], peer.acknowledged,
-           let since = peer.sentSinceReceived, now.timeIntervalSince(since) >= 15 {
+           peer.sentSinceReceived.map({ now.timeIntervalSince($0) >= 15 }) == true
+            || owedSince.map({ now.timeIntervalSince($0) >= 5 }) == true {
             peer.acknowledged = false; peer.rejoining = true; peer.lastMeow = .distantPast
-            peer.sentSinceReceived = nil
+            peer.sentSinceReceived = nil; owedSince = nil
             peers[address.serverPublicKey.rawValue] = peer
         }
         if !server, peers[address.serverPublicKey.rawValue]?.acknowledged == false {

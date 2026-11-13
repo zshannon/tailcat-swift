@@ -600,6 +600,13 @@ internal actor IPStack {
         }
     }
 
+    /// Some flow has had to send its first unacknowledged segment again, and still waits.
+    var retransmitting: Bool {
+        (Array(connections.values) + Array(closing.values)).contains {
+            $0.finishedAt == nil && ($0.segments.first?.retries ?? 0) > 0
+        }
+    }
+
     private func acknowledge(_ state: TCPState, _ ack: UInt32) {
         guard !Self.before(ack, state.sendUnacknowledged), !Self.before(state.sendNext, ack) else { return }
         let advanced = Int(ack &- state.sendUnacknowledged)
