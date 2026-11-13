@@ -312,7 +312,7 @@ internal actor TailcatEngine {
         var sentSinceReceived: Date?
         /// Data came in with nothing sent since: WireGuard's passive keepalive answers it.
         var receivedSinceSent: Date?
-        /// Meowing again on a session the server may have lost.
+        /// Meowing again on a session the server may have lost, until the new one is made.
         var rejoining = false
         var lastSend = Date()
         var pending: [Data] = []
@@ -529,7 +529,7 @@ internal actor TailcatEngine {
                 startupTrace?.record("meowAcknowledged")
                 guard var peer = peers[packet.source] else { return }
                 let early = peer.earlyInitiation, rejoining = peer.rejoining
-                peer.acknowledged = true; peer.earlyInitiation = nil; peer.rejoining = false
+                peer.acknowledged = true; peer.earlyInitiation = nil
                 if let early, rejoining {
                     // A restarted server dropped the copy sent before it admitted us; one that
                     // kept our session took it, and drops this replay.
@@ -556,6 +556,8 @@ internal actor TailcatEngine {
             let result = try peer.wireguard.receive(data)
             peer.sentSinceReceived = nil
             if result.handshakeCompleted { startupTrace?.record("wireGuardEstablished") }
+            let rejoined = result.handshakeCompleted && peer.rejoining
+            if rejoined { peer.rejoining = false }
             if WireGuard.packetType(data) == 4, peer.wireguard.isEstablished {
                 peer.authenticated = true; peer.lastReceived = Date()
             }
@@ -572,6 +574,9 @@ internal actor TailcatEngine {
                 if result.response == nil { try await sendPayload(Data(), to: packet.source) }
                 await network.allowDirect(to: packet.source)
                 await flush(packet.source)
+                // What went on the old session may be lost with it: resend it now rather
+                // than when each flow's backed-off timer comes round.
+                if rejoined { await stack?.resendOwed() }
             }
             if let plaintext = result.plaintext, !plaintext.isEmpty {
                 peers[packet.source]?.lastActivity = Date()
