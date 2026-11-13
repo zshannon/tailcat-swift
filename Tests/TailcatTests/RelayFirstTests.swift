@@ -854,6 +854,46 @@ final class RelayFirstTests: XCTestCase {
         } catch { await client.close(); await server.close(); throw error }
     }
 
+    func testAResetMarkerJustAfterAProbeIsRevalidatedAtOnce() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        let filter = DiscoveryPacketFilter()
+        var discovery = loopbackDiscovery()
+        discovery.open = { receive in try UDPChannel { packet, endpoint in if !filter.drops(packet) { receive(packet, endpoint) } } }
+        var serverDiscovery = loopbackDiscovery()
+        serverDiscovery.open = { receive in
+            try UDPChannel { packet, endpoint in
+                guard Discovery.isPacket(packet) else { return receive(packet, endpoint) }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.02) { receive(packet, endpoint) }
+            }
+        }
+        let pair = try await wakePair(fixture, port: 8097, client: discovery, server: serverDiscovery)
+        do {
+            try await eventually {
+                if case .direct = await pair.client.path,
+                   case .direct = try? await pair.server.path(to: pair.client.publicKey) { return true }
+                return false
+            }
+            try await Task.sleep(nanoseconds: 1_500_000_000)
+            // The wake's invitation has the server probe; the client's own Pongs
+            // are lost, so its first data sends the server a reset marker just after.
+            await pair.client.ageDirectForTesting(by: 31)
+            filter.setBlocked(true)
+            await pair.client.wake()
+            try await Task.sleep(nanoseconds: 150_000_000)
+            filter.setBlocked(false)
+            try await exchange(pair.stream, pair.accepted, "first data after waking")
+            let sent = Date()
+            try await within(0.5) {
+                while true {
+                    if case .direct = try await pair.server.path(to: pair.client.publicKey) { return }
+                    try await Task.sleep(nanoseconds: 10_000_000)
+                }
+            }
+            print("MARKER-DIRECT-AGAIN \(Int(Date().timeIntervalSince(sent) * 1000))ms")
+            await pair.client.close(); await pair.server.close()
+        } catch { await pair.client.close(); await pair.server.close(); throw error }
+    }
+
     func testALostInitiationIsRetriedWithinASecondWhileDataWaits() async throws {
         let fixture = try LocalRelay(); defer { fixture.close() }
         let gate = DiscoveryGate()
