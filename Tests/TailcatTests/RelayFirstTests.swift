@@ -314,6 +314,60 @@ final class RelayFirstTests: XCTestCase {
         } catch { await a.close(); await b.close(); throw error }
     }
 
+    func testAClientRecoversFromAServerThatRestartedWithoutItsSession() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        var serverConfig = TailcatServer.Configuration()
+        serverConfig.relayFirst = true
+        serverConfig.region = DERPRegion(regionID: 1, nodes: [fixture.node])
+        serverConfig.directDiscovery = gatedDiscovery(DiscoveryGate())
+        serverConfig.privateKey = try NodePrivateKey.generate()
+        serverConfig.presharedKey = try PresharedKey.generate()
+        let first = TailcatServer(configuration: serverConfig), second = TailcatServer(configuration: serverConfig)
+        let firstListener = try await first.listen(port: 8098)
+        var config = TailcatClient.Configuration()
+        config.relayFirst = true; config.directDiscovery = gatedDiscovery(DiscoveryGate())
+        let client = try await TailcatClient.connect(to: first.address, configuration: config)
+        do {
+            let stream = try await client.openTCP(port: 8098)
+            try await exchange(stream, try await firstListener.accept(), "before the restart")
+            // The computer restarts with the same key while the phone is away:
+            // it holds no session for the phone, and hasn't admitted it.
+            await first.close()
+            let listener = try await second.listen(port: 8098)
+            let opening = Task { try await client.openTCP(port: 8098) }
+            try await Task.sleep(nanoseconds: 300_000_000)
+            // Fifteen seconds without an answer to what the client sent.
+            await client.ageUnansweredForTesting(by: 15)
+            let started = Date()
+            let accepted = try await within(5) { try await listener.accept() }
+            let fresh = try await within(5) { try await opening.value }
+            try await exchange(fresh, accepted, "after the restart")
+            print("SERVER-RESTART-RECOVERED \(Int(Date().timeIntervalSince(started) * 1000))ms")
+            // The connection from before the restart is reset, rather than left hanging.
+            do {
+                _ = try await within(5) { try await stream.write(Data("stale".utf8)); return try await stream.read() }
+                XCTFail("the connection from before the restart still answered")
+            } catch TailcatError.timedOut { XCTFail("the connection from before the restart hung") } catch {}
+            await client.close(); await second.close()
+        } catch { await client.close(); await second.close(); throw error }
+    }
+
+    func testRejoiningAServerThatKeptItsSessionKeepsTheConnection() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        let gate = DiscoveryGate()
+        let pair = try await wakePair(fixture, port: 8099, client: gatedDiscovery(gate))
+        do {
+            try await exchange(pair.stream, pair.accepted, "before")
+            let initiations = fixture.relayedInitiations
+            await pair.client.ageUnansweredForTesting(by: 15)
+            try await Task.sleep(nanoseconds: 2_500_000_000)
+            try await exchange(pair.stream, pair.accepted, "after rejoining")
+            // The initiation that went with the meow, and its replay once meowed, which the server drops.
+            XCTAssertEqual(fixture.relayedInitiations, initiations + 2)
+            await gate.release(); await pair.client.close(); await pair.server.close()
+        } catch { await gate.release(); await pair.client.close(); await pair.server.close(); throw error }
+    }
+
     func testBlockedSTUNDoesNotDelayEncryptedRelaySession() async throws {
         let fixture = try LocalRelay(); defer { fixture.close() }
         let gate = DiscoveryGate()

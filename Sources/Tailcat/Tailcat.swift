@@ -233,6 +233,7 @@ public actor TailcatClient {
     #if DEBUG
     func ageForTesting(by seconds: TimeInterval) async { await engine.ageForTesting(by: seconds) }
     func ageDirectForTesting(by seconds: TimeInterval) async { await engine.ageDirectForTesting(by: seconds) }
+    func ageUnansweredForTesting(by seconds: TimeInterval) async { await engine.ageUnansweredForTesting(by: seconds) }
     #endif
     /// This client's TCP flows to the server, open and closing, against
     /// the budgets in `TailcatFlowStatistics`.
@@ -307,6 +308,12 @@ internal actor TailcatEngine {
         /// When data first went on a session the server has yet to answer: the server may hold
         /// another keypair for our initiation. `.distantPast` once a fresh one was sent for it.
         var unansweredSince: Date?
+        /// When data first went out with nothing authenticated back since, counted from a wake.
+        var sentSinceReceived: Date?
+        /// Data came in with nothing sent since: WireGuard's passive keepalive answers it.
+        var receivedSinceSent: Date?
+        /// Meowing again on a session the server may have lost.
+        var rejoining = false
         var lastSend = Date()
         var pending: [Data] = []
         var pendingBytes = 0
@@ -454,6 +461,8 @@ internal actor TailcatEngine {
         for node in Array(peers.keys) where peers[node]?.wireguard.isUsable() == false {
             peers[node]?.rekeyNow = true; peers[node]?.lastHandshake = .distantPast
         }
+        // An answer due while suspended had no chance to come.
+        for node in Array(peers.keys) { peers[node]?.sentSinceReceived = nil }
         await tick()
     }
     func resetNetwork() async { await network.resetNetwork() }
@@ -470,6 +479,10 @@ internal actor TailcatEngine {
         }
     }
     func ageDirectForTesting(by seconds: TimeInterval) async { await network.ageDirectForTesting(by: seconds) }
+    /// As if what was sent had gone unanswered for `seconds` longer.
+    func ageUnansweredForTesting(by seconds: TimeInterval) {
+        for node in Array(peers.keys) { peers[node]?.sentSinceReceived? -= seconds }
+    }
     #endif
     func receiveDrops() async -> Int { await network.receiveDrops }
     func flowStatistics() async -> TailcatFlowStatistics {
@@ -515,9 +528,14 @@ internal actor TailcatEngine {
             } else if !server, data.count >= 5, data[4] == 2, packet.source == address.serverPublicKey.rawValue {
                 startupTrace?.record("meowAcknowledged")
                 guard var peer = peers[packet.source] else { return }
-                let early = peer.earlyInitiation
-                peer.acknowledged = true; peer.earlyInitiation = nil
-                if let early, !peer.wireguard.isEstablished {
+                let early = peer.earlyInitiation, rejoining = peer.rejoining
+                peer.acknowledged = true; peer.earlyInitiation = nil; peer.rejoining = false
+                if let early, rejoining {
+                    // A restarted server dropped the copy sent before it admitted us; one that
+                    // kept our session took it, and drops this replay.
+                    peers[packet.source] = peer
+                    try? await network.send(to: packet.source, packet: early)
+                } else if let early, !peer.wireguard.isEstablished {
                     // Every early copy may have come before the server admitted us: one more
                     // is answered now. If one was taken and its response lost, the rest are
                     // replays, so a fresh initiation follows after twice the meow's round trip.
@@ -536,6 +554,7 @@ internal actor TailcatEngine {
         let previouslyAuthenticated = peer.authenticated
         do {
             let result = try peer.wireguard.receive(data)
+            peer.sentSinceReceived = nil
             if result.handshakeCompleted { startupTrace?.record("wireGuardEstablished") }
             if WireGuard.packetType(data) == 4, peer.wireguard.isEstablished {
                 peer.authenticated = true; peer.lastReceived = Date()
@@ -556,6 +575,7 @@ internal actor TailcatEngine {
             }
             if let plaintext = result.plaintext, !plaintext.isEmpty {
                 peers[packet.source]?.lastActivity = Date()
+                if peers[packet.source]?.receivedSinceSent == nil { peers[packet.source]?.receivedSinceSent = Date() }
                 guard plaintext.count >= 40, plaintext[0] >> 4 == 6,
                       let identity = try? NodePublicKey(rawValue: packet.source),
                       (!server || Data(plaintext[8..<24]) == identity.address) else { return }
@@ -725,9 +745,10 @@ internal actor TailcatEngine {
     private func sendPayload(_ packet: Data, to node: Data) async throws {
         guard var peer = peers[node] else { throw TailcatError.peerRejected }
         let encrypted = try peer.wireguard.encrypt(packet)
-        peer.lastSend = Date()
+        peer.lastSend = Date(); peer.receivedSinceSent = nil
         if !packet.isEmpty { peer.lastActivity = peer.lastSend }
         if !packet.isEmpty, !peer.authenticated, peer.unansweredSince == nil { peer.unansweredSince = peer.lastSend }
+        if !packet.isEmpty, peer.sentSinceReceived == nil { peer.sentSinceReceived = peer.lastSend }
         peers[node] = peer
         try await network.send(to: node, packet: encrypted)
     }
@@ -764,6 +785,16 @@ internal actor TailcatEngine {
                 await handlerUDP.removeValue(forKey: handlerKey)?.close()
             }
             await target.close(); targets.removeValue(forKey: destination); targetActivity.removeValue(forKey: destination)
+        }
+        // As in WireGuard, data with nothing authenticated back for its keepalive and rekey
+        // timeouts, 15 s, starts a new handshake. A server restarted with the same key holds
+        // neither our session nor our admission, so the handshake goes with a meow, as when
+        // connecting. The session stays in use until the new one replaces it.
+        if !server, var peer = peers[address.serverPublicKey.rawValue], peer.acknowledged,
+           let since = peer.sentSinceReceived, now.timeIntervalSince(since) >= 15 {
+            peer.acknowledged = false; peer.rejoining = true; peer.lastMeow = .distantPast
+            peer.sentSinceReceived = nil
+            peers[address.serverPublicKey.rawValue] = peer
         }
         if !server, peers[address.serverPublicKey.rawValue]?.acknowledged == false {
             var peer = peers[address.serverPublicKey.rawValue]!
@@ -816,6 +847,9 @@ internal actor TailcatEngine {
                 peers[node] = peer
                 startupTrace?.record("wireGuardInitiationSendStarted")
                 try await network.send(to: node, packet: handshake)
+            } else if peer.wireguard.isUsable(now: now), let received = peer.receivedSinceSent, now.timeIntervalSince(received) >= 10 {
+                // WireGuard's passive keepalive: data answered within its keepalive timeout.
+                try await sendPayload(Data(), to: node)
             } else if peer.wireguard.isUsable(now: now), due, now.timeIntervalSince(peer.lastSend) >= (idle ? Self.idleKeepalive : 25) { try await sendPayload(Data(), to: node) }
             } catch { if !server { throw error } }
         }
