@@ -466,6 +466,46 @@ final class RelayFirstTests: XCTestCase {
         } catch { await client.close(); await second.close(); throw error }
     }
 
+    func testEveryClientOfARestartedServerIsToldToMeowAgain() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        var serverConfig = TailcatServer.Configuration()
+        serverConfig.relayFirst = true
+        serverConfig.region = DERPRegion(regionID: 1, nodes: [fixture.node])
+        serverConfig.directDiscovery = gatedDiscovery(DiscoveryGate())
+        serverConfig.privateKey = try NodePrivateKey.generate()
+        serverConfig.presharedKey = try PresharedKey.generate()
+        let first = TailcatServer(configuration: serverConfig), second = TailcatServer(configuration: serverConfig)
+        let firstListener = try await first.listen(port: 8105)
+        // Two clients of one server, as the app's for requests and for files: each has to
+        // find out on its own, and neither gets an invitation.
+        var clients = [TailcatClient]()
+        do {
+            for _ in 0..<2 {
+                var config = TailcatClient.Configuration()
+                config.relayFirst = true; config.directDiscovery = gatedDiscovery(DiscoveryGate())
+                let client = try await TailcatClient.connect(to: first.address, configuration: config)
+                clients.append(client)
+                try await exchange(try await client.openTCP(port: 8105), try await firstListener.accept(), "before the restart")
+            }
+            await first.close()
+            let listener = try await second.listen(port: 8105)
+            let openings = clients.map { client in Task { try await client.openTCP(port: 8105) } }
+            try await Task.sleep(nanoseconds: 300_000_000)
+            for client in clients { await client.resumeForTesting(after: 20) }
+            let started = Date()
+            for client in clients { await client.wake() }
+            for opening in openings {
+                let accepted = try await within(5) { try await listener.accept() }
+                _ = accepted
+                _ = try await within(5) { try await opening.value }
+            }
+            let elapsed = Date().timeIntervalSince(started)
+            print("MEOW-AGAIN-REJOIN \(Int(elapsed * 1000))ms")
+            XCTAssertLessThan(elapsed, 1)
+            for client in clients { await client.close() }; await second.close()
+        } catch { for client in clients { await client.close() }; await second.close(); throw error }
+    }
+
     func testBlockedSTUNDoesNotDelayEncryptedRelaySession() async throws {
         let fixture = try LocalRelay(); defer { fixture.close() }
         let gate = DiscoveryGate()

@@ -283,6 +283,8 @@ internal actor TailcatEngine {
     private var stack: IPStack!
     private var peers: [Data: Peer] = [:]
     private var admitting: [Data: (UUID, Task<Void, Never>)] = [:]
+    /// When each client the server holds no session for was last told to meow again.
+    private var askedToMeow: [Data: Date] = [:]
     private var reader: Task<Void, Never>?
     private var recoveries: Task<Void, Never>?
     private var restarts: Task<Void, Never>?
@@ -570,6 +572,10 @@ internal actor TailcatEngine {
                     guard let self else { return }; await self.admit(identity, disco: disco, attempt: attempt)
                 }
                 admitting[node] = (attempt, task)
+            } else if !server, data.count >= 5, data[4] == 3, packet.source == address.serverPublicKey.rawValue {
+                // Meow again: the server holds no session for us, as after it restarted.
+                rejoin()
+                try? await tickThrowing()
             } else if !server, data.count >= 5, data[4] == 2, packet.source == address.serverPublicKey.rawValue {
                 startupTrace?.record("meowAcknowledged")
                 guard var peer = peers[packet.source] else { return }
@@ -595,7 +601,10 @@ internal actor TailcatEngine {
             }
             return
         }
-        guard var peer = peers[packet.source] else { return }
+        guard var peer = peers[packet.source] else {
+            if server, packet.viaRelay { await askToMeowAgain(packet.source) }
+            return
+        }
         let previouslyAuthenticated = peer.authenticated
         do {
             let result = try peer.wireguard.receive(data)
@@ -653,6 +662,17 @@ internal actor TailcatEngine {
         await network.observeAuthenticatedTransport(from: packet.source, viaRelay: packet.viaRelay,
                                                      receiver: Data(header[4..<8]), counter: counter,
                                                      allowFallback: allowFallback && counter > 0)
+    }
+    /// A client still sending on a session this server doesn't have, as after it restarted,
+    /// is told to meow again, at most once a second: otherwise it waits for its own timeouts.
+    private func askToMeowAgain(_ node: Data) async {
+        guard admitting[node] == nil, let identity = try? NodePublicKey(rawValue: node) else { return }
+        let now = Date()
+        if let last = askedToMeow[node], now.timeIntervalSince(last) < 1 { return }
+        if askedToMeow.count >= 1024 { askedToMeow.removeAll() }
+        askedToMeow[node] = now
+        guard await allowClient?(identity) ?? true, !closed, peers[node] == nil else { return }
+        try? await network.send(to: node, packet: Data("meow\u{03}".utf8))
     }
     private func admit(_ identity: NodePublicKey, disco: Data, attempt: UUID) async {
         let node = identity.rawValue
