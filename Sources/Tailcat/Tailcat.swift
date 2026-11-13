@@ -347,7 +347,7 @@ internal actor TailcatEngine {
         }
         try await network.start()
         reader = Task { [weak self, network] in
-            do { for try await packet in network.packets { await self?.receive(packet) } }
+            do { for try await packet in network.packets { network.receiveGauge.departed(); await self?.receive(packet) } }
             catch { await self?.close() }
         }
         recoveries = Task { [weak self, network] in

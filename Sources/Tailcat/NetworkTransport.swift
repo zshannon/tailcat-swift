@@ -15,6 +15,54 @@ enum TransportDiagnostics {
         FileHandle.standardError.write(Data(text.utf8))
     }
 }
+
+/// Traces a receive queue's depth as it crosses 64, 256 and 512 packets either way,
+/// with how long its oldest packet has waited. Does nothing unless tracing.
+final class QueueGauge: @unchecked Sendable {
+    private static let thresholds = [64, 256, 512]
+    private let name: String
+    private let lock = NSLock()
+    /// When each queued packet arrived, oldest first from `head`.
+    private var arrivals: [TimeInterval] = []
+    private var head = 0
+    private let enabled: Bool
+    private let log: @Sendable (String) -> Void
+    init(_ name: String, enabled: Bool = TransportDiagnostics.enabled,
+         log: @escaping @Sendable (String) -> Void = { TransportDiagnostics.log($0) }) {
+        self.name = name; self.enabled = enabled; self.log = log
+    }
+
+    /// Called before the packet is yielded, so its reader can never take it first.
+    func arrived() {
+        guard enabled else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock(); defer { lock.unlock() }
+        arrivals.append(now)
+        if Self.thresholds.contains(arrivals.count - head) { report("up", depth: arrivals.count - head, now: now) }
+    }
+
+    /// The queue was full and lost its oldest packet.
+    func overflowed() {
+        guard enabled else { return }
+        lock.lock(); defer { lock.unlock() }
+        if head < arrivals.count { head += 1 }
+    }
+
+    func departed() {
+        guard enabled else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock(); defer { lock.unlock() }
+        guard head < arrivals.count else { return }
+        if Self.thresholds.contains(arrivals.count - head) { report("down", depth: arrivals.count - head - 1, now: now) }
+        head += 1
+        if head >= 1024 { arrivals.removeFirst(head); head = 0 }
+    }
+
+    private func report(_ direction: String, depth: Int, now: TimeInterval) {
+        let waited = Int((now - arrivals[head]) * 1000)
+        log("receive queue \(name) \(direction) depth=\(depth) oldest=\(waited)ms")
+    }
+}
 #if canImport(Darwin)
 import Darwin
 #else
@@ -49,6 +97,7 @@ struct UDPIngress: Sendable {
     let packets: AsyncStream<UDPDatagram>
     private let continuation: AsyncStream<UDPDatagram>.Continuation
     private let overflows = OverflowCount()
+    let gauge = QueueGauge("udp")
     /// Datagrams dropped because the reader fell `capacity` behind.
     var dropped: Int { overflows.value }
     init() {
@@ -59,9 +108,10 @@ struct UDPIngress: Sendable {
     @discardableResult
     func offer(_ packet: Data, from endpoint: DiscoveryEndpoint) -> OfferResult {
         guard packet.count <= Self.maximumDatagramSize else { return .rejected }
+        gauge.arrived()
         switch continuation.yield(UDPDatagram(payload: packet, source: endpoint)) {
         case .enqueued: return .queued
-        case .dropped: overflows.add(); return .overflow
+        case .dropped: overflows.add(); gauge.overflowed(); return .overflow
         case .terminated: return .rejected
         @unknown default: return .rejected
         }
@@ -299,6 +349,7 @@ struct DirectDiscovery: Sendable {
 /// Routes encrypted WireGuard datagrams over verified UDP paths, with DERP fallback.
 public actor NetworkTransport {
     public nonisolated let packets: AsyncThrowingStream<TransportPacket, Error>
+    nonisolated let receiveGauge = QueueGauge("engine")
     private let continuation: AsyncThrowingStream<TransportPacket, Error>.Continuation
     private var dropped = 0
     /// Dropped by UDP ingresses already replaced.
@@ -427,7 +478,7 @@ public actor NetworkTransport {
             TransportDiagnostics.log("ready relayFirst=\(relayFirst) udp=\(udp?.port ?? 0)")
             relayReader = Task { [weak self, relay] in
                 do {
-                    for try await packet in relay.packets { await self?.receiveRelay(packet) }
+                    for try await packet in relay.packets { relay.receiveGauge.departed(); await self?.receiveRelay(packet) }
                 } catch { await self?.relayEnded(error) }
             }
             #if canImport(Network)
@@ -465,6 +516,7 @@ public actor NetworkTransport {
         startupTrace?.record("udpBound", detail: String(channel.port))
         udpReader = Task { [weak self] in
             for await datagram in ingress.packets {
+                ingress.gauge.departed()
                 guard !Task.isCancelled else { break }
                 await self?.receiveUDP(datagram.payload, from: datagram.source, generation: generation)
             }
@@ -938,7 +990,9 @@ public actor NetworkTransport {
     }
 
     private func deliver(_ packet: TransportPacket) {
+        receiveGauge.arrived()
         if case .dropped = continuation.yield(packet) {
+            receiveGauge.overflowed()
             dropped += 1
             TransportDiagnostics.log("receive queue full; dropped relay=\(packet.viaRelay) total=\(dropped)")
         }

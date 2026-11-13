@@ -258,6 +258,7 @@ private final class DERPStream: @unchecked Sendable {
 /// Authenticated DERP client with bounded frames, keepalives and automatic reconnect.
 public actor DERPTransport {
     public nonisolated let packets: AsyncThrowingStream<DERPPacket, Error>
+    nonisolated let receiveGauge = QueueGauge("relay")
     private let continuation: AsyncThrowingStream<DERPPacket, Error>.Continuation
     /// Received packets wait here, and in `NetworkTransport.packets`, while the
     /// engine decrypts the ones before them. A burst is at most what the peer
@@ -626,8 +627,9 @@ public actor DERPTransport {
                 switch frame.type {
                 case 5:
                     guard frame.payload.count >= 32, frame.payload.count <= 65568 else { throw TransportError.malformedPacket }
+                    receiveGauge.arrived()
                     if case .dropped = continuation.yield(DERPPacket(source: Data(frame.payload.prefix(32)), payload: Data(frame.payload.dropFirst(32)))) {
-                        receiveDrops += 1
+                        receiveDrops += 1; receiveGauge.overflowed()
                     }
                 case 6:
                     guard frame.payload.isEmpty else { throw TransportError.malformedPacket }

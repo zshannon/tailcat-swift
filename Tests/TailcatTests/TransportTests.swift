@@ -150,6 +150,21 @@ final class TransportTests: XCTestCase {
         XCTAssertEqual(ingress.offer(Data([1]), from: source), .rejected)
     }
 
+    func testQueueGaugeTracesDepthCrossingsWithTheOldestWait() {
+        final class Lines: @unchecked Sendable { var values: [String] = []; let lock = NSLock() }
+        let lines = Lines()
+        let gauge = QueueGauge("relay", enabled: true) { line in lines.lock.lock(); lines.values.append(line); lines.lock.unlock() }
+        for _ in 0..<63 { gauge.arrived() }
+        XCTAssertEqual(lines.values, [])
+        gauge.arrived()
+        gauge.overflowed(); gauge.arrived()
+        gauge.departed()
+        gauge.departed()
+        XCTAssertEqual(lines.values.map { $0.replacingOccurrences(of: #"oldest=\d+ms"#, with: "oldest=_", options: .regularExpression) },
+                       ["receive queue relay up depth=64 oldest=_", "receive queue relay up depth=64 oldest=_",
+                        "receive queue relay down depth=63 oldest=_"])
+    }
+
     func testUDPIngressHoldsAFullWindowAndCountsWhatItDrops() throws {
         let ingress = UDPIngress()
         let source = try DiscoveryEndpoint("192.0.2.1:1234")
