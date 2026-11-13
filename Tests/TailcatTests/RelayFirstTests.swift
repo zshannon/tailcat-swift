@@ -506,6 +506,43 @@ final class RelayFirstTests: XCTestCase {
         } catch { for client in clients { await client.close() }; await second.close(); throw error }
     }
 
+    func testAServerRestartedDuringAShortAbsenceIsRejoinedAtOnce() async throws {
+        for away: TimeInterval in [5, 20] {
+            let fixture = try LocalRelay(); defer { fixture.close() }
+            var serverConfig = TailcatServer.Configuration()
+            serverConfig.relayFirst = true
+            serverConfig.region = DERPRegion(regionID: 1, nodes: [fixture.node])
+            serverConfig.directDiscovery = loopbackDiscovery()
+            serverConfig.privateKey = try NodePrivateKey.generate()
+            serverConfig.presharedKey = try PresharedKey.generate()
+            let first = TailcatServer(configuration: serverConfig), second = TailcatServer(configuration: serverConfig)
+            let firstListener = try await first.listen(port: 8106)
+            var config = TailcatClient.Configuration()
+            config.relayFirst = true; config.directDiscovery = loopbackDiscovery()
+            let client = try await TailcatClient.connect(to: first.address, configuration: config)
+            do {
+                try await exchange(try await client.openTCP(port: 8106), try await firstListener.accept(), "before the restart")
+                try await eventually { if case .direct = await client.path { return true }; return false }
+                // Away for less than a direct route lives: the client still sends direct, to
+                // the old process's port, and the new one sends no invitation.
+                await first.close()
+                let listener = try await second.listen(port: 8106)
+                let opening = Task { try await client.openTCP(port: 8106) }
+                try await Task.sleep(nanoseconds: 300_000_000)
+                await client.ageDirectForTesting(by: away)
+                await client.resumeForTesting(after: away)
+                let started = Date()
+                await client.wake()
+                _ = try await within(5) { try await listener.accept() }
+                _ = try await within(5) { try await opening.value }
+                let elapsed = Date().timeIntervalSince(started)
+                print("SHORT-ABSENCE-REJOIN away=\(Int(away)) \(Int(elapsed * 1000))ms")
+                XCTAssertLessThan(elapsed, 1, "away \(away) s")
+                await client.close(); await second.close()
+            } catch { await client.close(); await second.close(); throw error }
+        }
+    }
+
     func testBlockedSTUNDoesNotDelayEncryptedRelaySession() async throws {
         let fixture = try LocalRelay(); defer { fixture.close() }
         let gate = DiscoveryGate()

@@ -573,7 +573,9 @@ internal actor TailcatEngine {
                 }
                 admitting[node] = (attempt, task)
             } else if !server, data.count >= 5, data[4] == 3, packet.source == address.serverPublicKey.rawValue {
-                // Meow again: the server holds no session for us, as after it restarted.
+                // Meow again: the server holds no session for us, as after it restarted, and
+                // its old socket, the direct route's end, is gone with it.
+                await network.invalidateDirectPath(to: packet.source)
                 rejoin()
                 try? await tickThrowing()
             } else if !server, data.count >= 5, data[4] == 2, packet.source == address.serverPublicKey.rawValue {

@@ -750,6 +750,8 @@ public actor NetworkTransport {
         for key in peers.keys {
             peers[key]?.lastCall = .distantPast
             scheduleProbe(key, force: true); scheduleInvitation(key)
+            // Over the relay at once, not after the direct check: a server restarted meanwhile answers it.
+            requestRelayMarker(to: key); Task { [weak self] in try? await self?.sendPendingRelayMarker(to: key) }
         }
         directCheck?.cancel()
         directCheck = Task { [weak self] in
