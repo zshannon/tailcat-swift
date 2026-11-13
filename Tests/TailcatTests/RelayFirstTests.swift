@@ -732,6 +732,34 @@ final class RelayFirstTests: XCTestCase {
         } catch { await pair.client.close(); await pair.server.close(); throw error }
     }
 
+    func testAClientSuspendedBeforeTheServerFirstAnswersKeepsItsServer() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        var serverConfig = TailcatServer.Configuration()
+        serverConfig.relayFirst = true
+        serverConfig.region = DERPRegion(regionID: 1, nodes: [fixture.node])
+        serverConfig.directDiscovery = loopbackDiscovery()
+        let server = TailcatServer(configuration: serverConfig)
+        let listener = try await server.listen(port: 8096)
+        let address = try await server.address
+        // The server's answer to the key confirmation is still on its way when
+        // the client is suspended: nothing authenticated has come back yet.
+        fixture.dropKeepalives(from: address.serverPublicKey.rawValue, 1)
+        var config = TailcatClient.Configuration()
+        config.relayFirst = true; config.directDiscovery = loopbackDiscovery()
+        let client = try await TailcatClient.connect(to: address, configuration: config)
+        do {
+            await client.ageForTesting(by: 31)
+            // A timer tick runs before the first request after waking.
+            try await Task.sleep(nanoseconds: 1_500_000_000)
+            let (stream, accepted) = try await within {
+                let stream = try await client.openTCP(port: 8096)
+                return (stream, try await listener.accept())
+            }
+            try await exchange(stream, accepted, "first request after waking")
+            await client.close(); await server.close()
+        } catch { await client.close(); await server.close(); throw error }
+    }
+
     func testALostInitiationIsRetriedWithinASecondWhileDataWaits() async throws {
         let fixture = try LocalRelay(); defer { fixture.close() }
         let gate = DiscoveryGate()

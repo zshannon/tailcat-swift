@@ -400,6 +400,7 @@ internal actor TailcatEngine {
             guard var peer = peers[node] else { continue }
             peer.wireguard.ageForTesting(by: seconds)
             peer.lastActivity -= seconds; peer.lastSend -= seconds; peer.lastReceived -= seconds; peer.lastHandshake -= seconds
+            peer.admittedAt -= seconds
             peers[node] = peer
         }
     }
@@ -659,7 +660,8 @@ internal actor TailcatEngine {
         guard !closed else { throw TailcatError.closed }
         let now = Date()
         selectedTCPHandlers = selectedTCPHandlers.filter { now.timeIntervalSince($0.value.1) < 60 }
-        for node in peers.filter({ !$0.value.authenticated && now.timeIntervalSince($0.value.admittedAt) >= 30 }).map(\.key) {
+        // Only a server evicts: a client's one peer is its server, and nothing would add it back.
+        for node in peers.filter({ server && !$0.value.authenticated && now.timeIntervalSince($0.value.admittedAt) >= 30 }).map(\.key) {
             peers.removeValue(forKey: node); await network.removePeer(nodeKey: node)
         }
         if server {
