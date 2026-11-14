@@ -99,6 +99,12 @@ struct WireGuard: Sendable {
 
     var isEstablished: Bool { current != nil }
 
+    /// Each slot's local and remote index, for tracing.
+    var slots: String {
+        func indexes(_ session: Session?) -> String { session.map { "\(Self.hex($0.localIndex))>\(Self.hex($0.remoteIndex))" } ?? "-" }
+        return "previous=\(indexes(previous)) current=\(indexes(current)) next=\(indexes(next)) pending=\(pending.map { Self.hex($0.localIndex) } ?? "-")"
+    }
+
     /// Established and still able to encrypt: an expired session must be
     /// replaced by a handshake before anything else is sent.
     func isUsable(now: Date = Date()) -> Bool {
@@ -143,6 +149,7 @@ struct WireGuard: Sendable {
         pending = Initiation(chain: chain, hash: hash, ephemeral: ephemeral, localIndex: index, created: now)
         answered = nil
         lastOutbound = Outbound(packet: packet, localIndex: index, created: now)
+        TransportDiagnostics.log("WG initiation sent sender=\(Self.hex(index)) \(slots)")
         return packet
     }
 
@@ -179,6 +186,7 @@ struct WireGuard: Sendable {
         let encrypted = try TailcatCrypto.seal(padded, key: session.sendKey, nonce: Self.nonce(counter))
         session.sendCounter += 1
         current = session
+        TransportDiagnostics.log("WG send current=\(Self.hex(session.localIndex))>\(Self.hex(session.remoteIndex)) counter=\(counter) bytes=\(plaintext.count)")
         return Self.le(UInt32(4)) + Self.le(session.remoteIndex) + Self.le(counter) + encrypted
     }
 
@@ -186,6 +194,17 @@ struct WireGuard: Sendable {
         guard packet.count >= 4 else { return nil }
         let bytes = [UInt8](packet.prefix(4))
         return UInt32(bytes[0]) | UInt32(bytes[1]) << 8 | UInt32(bytes[2]) << 16 | UInt32(bytes[3]) << 24
+    }
+
+    /// A packet's type and indexes, for tracing.
+    static func describe(_ packet: Data) -> String {
+        guard let type = packetType(packet), packet.count >= 8 else { return "type=?" }
+        let first = hex(u32(packet, 4))
+        switch type {
+        case 1: return "type=1 sender=\(first)"
+        case 2 where packet.count >= 12: return "type=2 sender=\(first) receiver=\(hex(u32(packet, 8)))"
+        default: return "type=\(type) receiver=\(first)"
+        }
     }
 
     private mutating func consumeInitiation(_ packet: Data, now: Date) throws -> ReceiveResult {
@@ -219,6 +238,7 @@ struct WireGuard: Sendable {
         lastTimestamp = timestamp
         lastInitiationReceived = now
         lastOutbound = Outbound(packet: response, localIndex: localIndex, created: now)
+        TransportDiagnostics.log("WG initiation received sender=\(Self.hex(remoteIndex)) \(slots)")
         return ReceiveResult(response: response)
     }
 
@@ -245,6 +265,7 @@ struct WireGuard: Sendable {
         current = Session(sendKey: transportKeys[0], receiveKey: transportKeys[1], localIndex: initiation.localIndex, remoteIndex: responder, created: now, initiator: true)
         answered = (initiation, (answered?.responders ?? []).union([responder]))
         pending = nil
+        TransportDiagnostics.log("WG response received sender=\(Self.hex(responder)) receiver=\(Self.hex(initiation.localIndex)) \(slots)")
         // The first transport authenticates the response for the responder and
         // promotes its next keypair even when there is no queued IP packet.
         return ReceiveResult(response: try encrypt(Data(), now: now), handshakeCompleted: true)
@@ -268,6 +289,7 @@ struct WireGuard: Sendable {
         if slot == 2 { previous=current; current=session; next=nil }
         else if slot == 1 { current=session }
         else { previous=session }
+        TransportDiagnostics.log("WG receive \(["previous", "current", "next"][slot])=\(Self.hex(index)) counter=\(counter) bytes=\(packet.count) \(slots)")
         let plaintext = try Self.unpadIP(padded)
         return ReceiveResult(plaintext: plaintext, handshakeCompleted: slot == 2)
     }
@@ -330,6 +352,7 @@ struct WireGuard: Sendable {
     private static func le<T: FixedWidthInteger>(_ value: T) -> Data {
         Data((0..<MemoryLayout<T>.size).map { UInt8(truncatingIfNeeded: value >> ($0*8)) })
     }
+    private static func hex(_ index: UInt32) -> String { String(index, radix: 16) }
     private static func u32(_ data: Data, _ offset: Int) -> UInt32 {
         (0..<4).reduce(0) { $0 | UInt32(data[offset+$1]) << ($1*8) }
     }

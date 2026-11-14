@@ -644,7 +644,9 @@ internal actor TailcatEngine {
                 if server { await deliverServerIP(ip) }
                 else if Data(ip[24..<40]) == publicKey.address { await stack.receive(ip) }
             }
-        } catch { TransportDiagnostics.log("WG reject server=\(server) relay=\(packet.viaRelay) bytes=\(data.count) error=\(error)") }
+        } catch {
+            TransportDiagnostics.log("WG reject server=\(server) relay=\(packet.viaRelay) \(WireGuard.describe(data)) bytes=\(data.count) error=\(error) \(peer.wireguard.slots)")
+        }
     }
 
     private func observeTransportPacket(_ packet: TransportPacket, allowFallback: Bool) async {
