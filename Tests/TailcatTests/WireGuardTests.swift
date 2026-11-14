@@ -155,6 +155,29 @@ final class WireGuardTests: XCTestCase {
         XCTAssertEqual(try b.receive(a.encrypt(ipPacket(9),now: now),now: now).plaintext,ipPacket(9))
     }
 
+    func testOurAnsweredInitiationOutranksTheCrossedOneWeAnsweredBeforeIt() throws {
+        // b sent an initiation while a was suspended. On waking, a initiates and answers b's.
+        // wireguard-go can take a's response even after answering a's initiation, which
+        // dropped its own initiation's index: it sends on the session a answered, yet never
+        // reads it again. a must stay on the session of its own initiation.
+        var (a,b) = try peers(); try establish(&a,&b,now: now)
+        let later = now.addingTimeInterval(20)
+        let crossed = try b.initiate(now: later)
+        let initiation = try a.initiate(now: later.addingTimeInterval(5))
+        let answer = try XCTUnwrap(a.receive(crossed, now: later.addingTimeInterval(5)).response)
+        let response = try XCTUnwrap(b.receive(initiation, now: later.addingTimeInterval(5)).response)
+        let onCrossed = try XCTUnwrap(b.receive(answer, now: later.addingTimeInterval(5)).response)
+        let confirmation = try XCTUnwrap(a.receive(response, now: later.addingTimeInterval(5)).response)
+        XCTAssertFalse(try a.receive(onCrossed, now: later.addingTimeInterval(5)).handshakeCompleted)
+        let data = try a.encrypt(ipPacket(7), now: later.addingTimeInterval(5))
+        XCTAssertEqual(Data(data[4..<8]), Data(response[4..<8]))
+        XCTAssertNotEqual(Data(data[4..<8]), Data(crossed[4..<8]))
+        // b crossed too, and likewise stays on its own initiation's session: each reads the other's.
+        XCTAssertFalse(try b.receive(confirmation, now: later.addingTimeInterval(5)).handshakeCompleted)
+        XCTAssertEqual(try b.receive(data, now: later.addingTimeInterval(5)).plaintext, ipPacket(7))
+        XCTAssertEqual(try a.receive(b.encrypt(ipPacket(8), now: later.addingTimeInterval(5)), now: later.addingTimeInterval(5)).plaintext, ipPacket(8))
+    }
+
     func testReplayWindowBoundariesAndLargeJumps() {
         var window=WireGuard.ReplayWindow()
         XCTAssertTrue(window.accept(0)); XCTAssertTrue(window.accept(1)); XCTAssertTrue(window.accept(63))

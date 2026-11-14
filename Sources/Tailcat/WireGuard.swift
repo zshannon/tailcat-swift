@@ -59,6 +59,10 @@ struct WireGuard: Sendable {
         var remoteIndex: UInt32
         var created: Date
         var initiator: Bool
+        /// Whether the peer's first packet on it makes it current: not once our own later
+        /// initiation was answered. The peer may still send on it, as wireguard-go does when
+        /// its initiation crossed ours, but we stay on the newer session.
+        var promotes = true
         var sendCounter: UInt64 = 0
         var replay = ReplayWindow()
     }
@@ -261,7 +265,7 @@ struct WireGuard: Sendable {
         _ = try TailcatCrypto.open(Data(packet[44..<60]), key: keys[2], nonce: Self.zeroNonce, authenticating: hash)
         let transportKeys = Self.kdf(keys[0], Data(), count: 2)
         // A later answer replaces the session it shares an index with; the responder dropped that one.
-        if pending != nil { previous = current }
+        if pending != nil { previous = current; next?.promotes = false }
         current = Session(sendKey: transportKeys[0], receiveKey: transportKeys[1], localIndex: initiation.localIndex, remoteIndex: responder, created: now, initiator: true)
         answered = (initiation, (answered?.responders ?? []).union([responder]))
         pending = nil
@@ -276,7 +280,7 @@ struct WireGuard: Sendable {
         let index = Self.u32(packet,4), counter = Self.u64(packet,8)
         let slot: Int
         var session: Session
-        if let candidate = next, candidate.localIndex == index { session=candidate; slot=2 }
+        if let candidate = next, candidate.localIndex == index { session=candidate; slot=candidate.promotes ? 2 : 3 }
         else if let candidate = current, candidate.localIndex == index { session=candidate; slot=1 }
         else if let candidate = previous, candidate.localIndex == index { session=candidate; slot=0 }
         else { throw Error.unexpectedMessage }
@@ -285,11 +289,12 @@ struct WireGuard: Sendable {
         guard replay.accept(counter) else { throw Error.replay }
         let padded = try TailcatCrypto.open(Data(packet.dropFirst(16)), key: session.receiveKey, nonce: Self.nonce(counter))
         session.replay = replay
-        if slot != 0 { answered = nil }
+        if slot == 1 || slot == 2 { answered = nil }
         if slot == 2 { previous=current; current=session; next=nil }
+        else if slot == 3 { next=session }
         else if slot == 1 { current=session }
         else { previous=session }
-        TransportDiagnostics.log("WG receive \(["previous", "current", "next"][slot])=\(Self.hex(index)) counter=\(counter) bytes=\(packet.count) \(slots)")
+        TransportDiagnostics.log("WG receive \(["previous", "current", "next", "superseded next"][slot])=\(Self.hex(index)) counter=\(counter) bytes=\(packet.count) \(slots)")
         let plaintext = try Self.unpadIP(padded)
         return ReceiveResult(plaintext: plaintext, handshakeCompleted: slot == 2)
     }

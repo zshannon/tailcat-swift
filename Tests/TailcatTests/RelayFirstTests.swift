@@ -34,6 +34,19 @@ private final class DiscoveryPacketFilter: @unchecked Sendable {
     }
 }
 
+/// The first packet it is given.
+private final class RelayedPacket: @unchecked Sendable {
+    private let lock = NSLock()
+    private var first: Data?
+    var packet: Data? { lock.lock(); defer { lock.unlock() }; return first }
+    /// Always true, so that a drop rule can keep what it drops.
+    func keep(_ packet: Data) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if first == nil { first = packet }
+        return true
+    }
+}
+
 /// The first receiver index it is asked about, and only that one, matches.
 private final class FirstReceiver: @unchecked Sendable {
     private let lock = NSLock()
@@ -426,6 +439,51 @@ final class RelayFirstTests: XCTestCase {
             await fresh.close()
             await gate.release(); await pair.client.close(); await pair.server.close()
         } catch { await gate.release(); await pair.client.close(); await pair.server.close(); throw error }
+    }
+
+    func testAHandshakeCrossedWithTheServersOwnNeedsNoRejoin() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        var serverConfig = TailcatServer.Configuration()
+        serverConfig.relayFirst = true
+        serverConfig.region = DERPRegion(regionID: 1, nodes: [fixture.node])
+        serverConfig.directDiscovery = gatedDiscovery(DiscoveryGate())
+        serverConfig.privateKey = try NodePrivateKey.generate()
+        serverConfig.presharedKey = try PresharedKey.generate()
+        let server = TailcatServer(configuration: serverConfig)
+        let listener = try await server.listen(port: 8107)
+        var config = TailcatClient.Configuration()
+        config.relayFirst = true; config.directDiscovery = gatedDiscovery(DiscoveryGate())
+        let client = try await TailcatClient.connect(to: server.address, configuration: config)
+        do {
+            let stream = try await client.openTCP(port: 8107), accepted = try await listener.accept()
+            try await exchange(stream, accepted, "before")
+            // The server's own initiation, sent while the client was suspended, crosses the one the
+            // client sends on waking. wireguard-go can take the client's answer to it after answering
+            // the client's initiation, then sends on the session that answer made but reads nothing
+            // on it: answering dropped its index. `crossed` is that session's server end.
+            let serverKey = try XCTUnwrap(serverConfig.privateKey), clientKey = await client.publicKey.rawValue
+            var crossed = try WireGuard(privateKey: serverKey.rawValue, peerPublicKey: clientKey,
+                                        presharedKey: try XCTUnwrap(serverConfig.presharedKey).rawValue)
+            let answer = RelayedPacket(), response = RelayedPacket(), serverPublicKey = try serverKey.publicKey.rawValue
+            fixture.drop(1) { source, packet in source == serverPublicKey && packet.first == 2 && response.keep(packet) }
+            fixture.drop(1) { source, packet in source == clientKey && packet.first == 2 && answer.keep(packet) }
+            // On waking the client initiates; the server's initiation reaches it before the answer.
+            await client.ageUnansweredForTesting(by: 15)
+            try await eventually { response.packet != nil }
+            try fixture.inject(try crossed.initiateHandshake(), from: serverPublicKey, to: clientKey)
+            try await eventually { answer.packet != nil }
+            try fixture.inject(try XCTUnwrap(response.packet), from: serverPublicKey, to: clientKey)
+            try await Task.sleep(nanoseconds: 300_000_000)
+            let onCrossed = try XCTUnwrap(crossed.receive(XCTUnwrap(answer.packet)).response)
+            try fixture.inject(onCrossed, from: serverPublicKey, to: clientKey)
+            try await Task.sleep(nanoseconds: 300_000_000)
+            let initiations = fixture.relayedInitiations, started = Date()
+            try await exchange(stream, accepted, "after crossing")
+            // Answered well inside the five seconds after which data owed would rejoin.
+            XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+            XCTAssertEqual(fixture.relayedInitiations, initiations)
+            fixture.stopDropping(); await client.close(); await server.close()
+        } catch { fixture.stopDropping(); await client.close(); await server.close(); throw error }
     }
 
     func testAServerBackOnNewPortsIsRejoinedAtOnce() async throws {
