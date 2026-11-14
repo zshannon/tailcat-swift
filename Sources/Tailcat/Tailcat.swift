@@ -873,8 +873,11 @@ internal actor TailcatEngine {
             if now.timeIntervalSince(peer.lastMeow) >= 1 {
                 // The first meow carries the initiation rather than waiting a round trip for
                 // meowed. The server drops it until it has admitted us, so the same bytes go
-                // again a few times; once a copy is taken, the rest are replays it drops.
-                let early = peer.lastMeow == .distantPast ? try peer.wireguard.initiateHandshake(now: now) : nil
+                // again a few times; once a copy is taken, the rest are replays it drops. A rejoin
+                // signalled again within a second of our last initiation meows again but keeps that
+                // initiation, whose answer may be on its way.
+                let fresh = peer.lastMeow == .distantPast && now.timeIntervalSince(peer.lastHandshake) >= 1
+                let early = fresh ? try peer.wireguard.initiateHandshake(now: now) : nil
                 peer.lastMeow = now
                 if let early { peer.lastHandshake = now; peer.earlyInitiation = early }
                 peers[address.serverPublicKey.rawValue] = peer
@@ -909,8 +912,11 @@ internal actor TailcatEngine {
             // the keypair whose answer was lost. One fresh initiation, which it can take only once.
             let unanswered = !server && !peer.authenticated && peer.wireguard.isEstablished
                 && peer.unansweredSince.map { $0 > .distantPast && now.timeIntervalSince($0) >= 1 } == true
-            if (!peer.wireguard.isEstablished || waiting || unanswered || (peer.wireguard.needsRekey(now: now) && due)),
-               now.timeIntervalSince(peer.lastHandshake) >= (waiting || unanswered ? 1 : 5) {
+            // A rejoin retries each second until its handshake completes: the old session, still
+            // usable here, would otherwise hold off a new handshake when the answer was lost.
+            let rejoining = !server && peer.rejoining
+            if (!peer.wireguard.isEstablished || waiting || unanswered || rejoining || (peer.wireguard.needsRekey(now: now) && due)),
+               now.timeIntervalSince(peer.lastHandshake) >= (waiting || unanswered || rejoining ? 1 : 5) {
                 // Clients initiate the first handshake. Either endpoint may rekey established sessions.
                 if server && !peer.wireguard.isEstablished { continue }
                 let handshake = try peer.wireguard.initiateHandshake(now: now)

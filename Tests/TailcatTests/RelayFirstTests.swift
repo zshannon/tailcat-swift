@@ -486,6 +486,61 @@ final class RelayFirstTests: XCTestCase {
         } catch { fixture.stopDropping(); await client.close(); await server.close(); throw error }
     }
 
+    func testARejoinWhoseAnswerWasLostHandshakesAgainWithinASecond() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        var serverConfig = TailcatServer.Configuration()
+        serverConfig.relayFirst = true
+        serverConfig.region = DERPRegion(regionID: 1, nodes: [fixture.node])
+        serverConfig.directDiscovery = gatedDiscovery(DiscoveryGate())
+        serverConfig.privateKey = try NodePrivateKey.generate()
+        serverConfig.presharedKey = try PresharedKey.generate()
+        let first = TailcatServer(configuration: serverConfig), second = TailcatServer(configuration: serverConfig)
+        let firstListener = try await first.listen(port: 8108)
+        var config = TailcatClient.Configuration()
+        config.relayFirst = true; config.directDiscovery = gatedDiscovery(DiscoveryGate())
+        let client = try await TailcatClient.connect(to: first.address, configuration: config)
+        do {
+            try await exchange(try await client.openTCP(port: 8108), try await firstListener.accept(), "before the restart")
+            await first.close()
+            let listener = try await second.listen(port: 8108)
+            // The restarted server tells the client to meow again, and takes the initiation that
+            // follows; its answer is lost. The old session, which still encrypts, is no answer.
+            let serverKey = try XCTUnwrap(serverConfig.privateKey).publicKey.rawValue
+            fixture.drop(1) { source, packet in source == serverKey && packet.first == 2 }
+            let started = Date()
+            let opening = Task { try await client.openTCP(port: 8108) }
+            let accepted = try await within(10) { try await listener.accept() }
+            let fresh = try await within(5) { try await opening.value }
+            // About a second after the lost answer: not the five after which data owed rejoins.
+            XCTAssertLessThan(Date().timeIntervalSince(started), 2.5)
+            try await exchange(fresh, accepted, "after the restart")
+            fixture.stopDropping(); await client.close(); await second.close()
+        } catch { fixture.stopDropping(); await client.close(); await second.close(); throw error }
+    }
+
+    func testARejoinSignalledAgainKeepsTheInitiationItSent() async throws {
+        let fixture = try LocalRelay(); defer { fixture.close() }
+        let gate = DiscoveryGate()
+        let pair = try await wakePair(fixture, port: 8109, client: gatedDiscovery(gate))
+        do {
+            try await exchange(pair.stream, pair.accepted, "before")
+            let client = await pair.client.publicKey.rawValue, server = try await pair.server.publicKey.rawValue
+            fixture.drop(1) { source, packet in source == server && packet.first == 2 }
+            let initiations = fixture.relayedInitiations
+            try fixture.inject(Data("meow\u{03}".utf8), from: server, to: client)
+            try await Task.sleep(nanoseconds: 300_000_000)
+            try fixture.inject(Data("meow\u{03}".utf8), from: server, to: client)
+            try await Task.sleep(nanoseconds: 400_000_000)
+            // The initiation and its copy once meowed; the second signal only meows again.
+            XCTAssertEqual(fixture.relayedInitiations, initiations + 2)
+            // A second after it, with its answer lost, one fresh initiation completes the rejoin.
+            try await Task.sleep(nanoseconds: 2_300_000_000)
+            XCTAssertEqual(fixture.relayedInitiations, initiations + 3)
+            try await exchange(pair.stream, pair.accepted, "after rejoining")
+            fixture.stopDropping(); await gate.release(); await pair.client.close(); await pair.server.close()
+        } catch { fixture.stopDropping(); await gate.release(); await pair.client.close(); await pair.server.close(); throw error }
+    }
+
     func testAServerBackOnNewPortsIsRejoinedAtOnce() async throws {
         let fixture = try LocalRelay(); defer { fixture.close() }
         var serverConfig = TailcatServer.Configuration()
